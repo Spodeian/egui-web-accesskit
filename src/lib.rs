@@ -162,7 +162,6 @@ mod tests {
 
         assert!(!clicked);
         assert!(!output.shapes.is_empty());
-        output.drop_without_applying_deltas();
         WebAccessKitPlugin::teardown(&ctx);
     }
 }

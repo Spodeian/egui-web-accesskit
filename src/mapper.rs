@@ -479,7 +479,6 @@ mod tests {
             .accesskit_update
             .take()
             .expect("accesskit_update must be emitted when enabled");
-        output.drop_without_applying_deltas();
 
         let mut bridge = TreeBridge::new();
         let ops = bridge.apply_update(update);
@@ -650,7 +649,6 @@ mod tests {
             }
         });
         let ops1 = bridge.apply_update(out1.platform_output.accesskit_update.take().unwrap());
-        out1.drop_without_applying_deltas();
         let temp_id = find_upsert(&ops1, |s| s.label.as_deref() == Some("Temporary")).id;
 
         checked = true;
@@ -663,7 +661,6 @@ mod tests {
             }
         });
         let ops2 = bridge.apply_update(out2.platform_output.accesskit_update.take().unwrap());
-        out2.drop_without_applying_deltas();
 
         let updated_checkbox = find_upsert(&ops2, |s| {
             s.aria_role == Some("checkbox") && s.label.as_deref() == Some("Subscribe")
@@ -697,7 +694,6 @@ mod tests {
             });
         });
         let ops1 = bridge.apply_update(out1.platform_output.accesskit_update.take().unwrap());
-        out1.drop_without_applying_deltas();
 
         let button_id = find_upsert(&ops1, |s| s.label.as_deref() == Some("Trigger")).id;
         let slider_id = find_upsert(&ops1, |s| s.label.as_deref() == Some("Volume")).id;
@@ -718,7 +714,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let out2 = ctx.run_ui(input2, |ui| {
+        let _ = ctx.run_ui(input2, |ui| {
             clicked = ui.button("Trigger").clicked();
             ui.add(
                 egui::Slider::new(&mut volume, 0.0..=100.0)
@@ -730,7 +726,6 @@ mod tests {
                 ui.label("Inside");
             });
         });
-        out2.drop_without_applying_deltas();
 
         assert!(clicked, "AccessKit click action must trigger egui button");
         assert!(text_focused, "AccessKit focus action must focus TextEdit");
@@ -742,7 +737,7 @@ mod tests {
             ))],
             ..Default::default()
         };
-        let out3 = ctx.run_ui(input3, |ui| {
+        let _ = ctx.run_ui(input3, |ui| {
             let _ = ui.button("Trigger");
             ui.add(
                 egui::Slider::new(&mut volume, 0.0..=100.0)
@@ -750,7 +745,6 @@ mod tests {
                     .text("Volume"),
             );
         });
-        out3.drop_without_applying_deltas();
         assert_eq!(volume, 65.0);
     }
 
@@ -774,7 +768,6 @@ mod tests {
         let mut bridge = TreeBridge::new();
         let mut out1 = ctx.run_ui(egui::RawInput::default(), show_scroll_ui);
         let ops1 = bridge.apply_update(out1.platform_output.accesskit_update.take().unwrap());
-        out1.drop_without_applying_deltas();
 
         let row0_id = find_upsert(&ops1, |s| s.label.as_deref() == Some("Row 0")).id;
         let y_row0_before = find_upsert(&ops1, |s| s.id == row0_id)
@@ -791,11 +784,9 @@ mod tests {
         };
         let mut out2 = ctx.run_ui(input2, show_scroll_ui);
         let _ = bridge.apply_update(out2.platform_output.accesskit_update.take().unwrap());
-        out2.drop_without_applying_deltas();
 
         let mut out3 = ctx.run_ui(egui::RawInput::default(), show_scroll_ui);
         let ops3 = bridge.apply_update(out3.platform_output.accesskit_update.take().unwrap());
-        out3.drop_without_applying_deltas();
 
         let y_row0_after = find_upsert(&ops3, |s| s.id == row0_id)
             .bounds
