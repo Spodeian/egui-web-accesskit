@@ -8,9 +8,9 @@ This repository mirrors `egui`'s minor version so there are no feature flags to 
 
 | `egui` / `eframe` | `egui-web-accesskit` | Branch / Tag |
 | --- | --- | --- |
-| `0.37` | `0.37` | `main` / `v0.37.1` |
-| `0.36` | `0.36` | `egui-0.36` / `v0.36.1` |
-| `0.35` | `0.35` | `egui-0.35` / `v0.35.1` |
+| `0.37` | `0.37` | `main` / `v0.37.2` |
+| `0.36` | `0.36` | `egui-0.36` / `v0.36.2` |
+| `0.35` | `0.35` | `egui-0.35` / `v0.35.2` |
 
 ## Quick Start
 
@@ -18,11 +18,11 @@ Add the crate version matching your `egui` / `eframe` dependency to `Cargo.toml`
 
 ```toml
 [dependencies]
-# For egui / eframe 0.35:
-egui-web-accesskit = "0.35"
+# For egui / eframe 0.37:
+egui-web-accesskit = "0.37"
 
-# Or pin this branch from git:
-# egui-web-accesskit = { git = "https://github.com/Spodeian/egui-web-accesskit", branch = "egui-0.35" }
+# Or pin a version-mirrored branch from git:
+# egui-web-accesskit = { git = "https://github.com/Spodeian/egui-web-accesskit", branch = "egui-0.36" }
 ```
 
 ```rust
@@ -40,8 +40,8 @@ On non-`wasm32` targets the plugin is a clean no-op so native builds can keep us
 ## How It Works
 
 1. `Plugin::setup` enables AccessKit on the `egui::Context` (`ctx.enable_accesskit()`), mounts a visually transparent `<div data-egui-accesskit="true" role="application">` aligned over the target `<canvas>`, and registers passive `window` `"scroll"` / `"resize"` listeners so `position: fixed` elements stay aligned even while `egui` is idle.
-2. `Plugin::output_hook` skips intermediate discarded layout passes, clones `output.platform_output.accesskit_update`, applies incremental changes with `accesskit_consumer::Tree`, and patches the mirrored HTML/ARIA elements — including `<textarea>` (`aria-multiline`), native heading elements (`<h1>`–`<h6>`) + `aria-level`, `aria-modal`, `aria-live`, `aria-description`, `aria-valuetext`, `placeholder`, `readonly`/`aria-readonly`, safe link `href`s, UTF-16 text selection sync, and `window.devicePixelRatio`-scaled bounds.
-3. `Plugin::input_hook` keeps `RawInput::focused` true while a mirrored DOM element has focus and drains DOM events (`click`, `focus` + `ScrollIntoView`, `input`, masked password `ReplaceSelectedText` edits, `select`/navigation `keyup` selection updates, `PageUp`/`PageDown` scroll actions, and arrow keys on unstepped sliders) into `RawInput::events` as `egui::Event::AccessKitActionRequest`.
+2. `Plugin::output_hook` skips intermediate discarded layout passes, clones `output.platform_output.accesskit_update`, applies incremental changes with `accesskit_consumer::Tree`, hoists popup subtrees attached to leaf elements (`<button>`, `<input>`, `<textarea>`, `<a>`) with `aria-controls` / `aria-expanded`, and patches mirrored HTML/ARIA elements — including `<textarea>` (`aria-multiline`), native heading elements (`<h1>`–`<h6>`) + `aria-level`, `aria-modal`, `aria-live`, `aria-description`, `aria-valuetext`, `placeholder`, `readonly`/`aria-readonly`, role-accurate `aria-pressed` / `aria-selected` / `aria-checked`, safe link `href`s, UTF-16 text selection sync, and `window.devicePixelRatio`-scaled bounds.
+3. `Plugin::input_hook` keeps `RawInput::focused` true while a mirrored DOM element has focus and drains DOM events (`click`, `Enter`/`Space` activation on custom roles such as `option`, `focus` + `ScrollIntoView`, `input`, masked password `ReplaceSelectedText` edits, `select`/navigation `keyup` selection updates, `PageUp`/`PageDown` scroll actions, and arrow keys on unstepped sliders) into `RawInput::events` as `egui::Event::AccessKitActionRequest`. On `egui 0.35`/`0.36` where `TextEdit` does not handle programmatic text mutations, DOM `beforeinput` events on mirrored text fields are canceled to prevent overlay value drift.
 4. `Plugin::on_exit` / `WebAccessKitPlugin::teardown` tears down DOM event listeners (including capture-phase `window` listeners) and removes the overlay container.
 
 ## Customizing AccessKit Semantics in `egui`
@@ -92,10 +92,10 @@ cargo clippy --target wasm32-unknown-unknown -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --target wasm32-unknown-unknown
 ```
 
-See [examples/demo/README.md](examples/demo/README.md) to run the interactive `eframe` demo in the browser or natively, and [e2e/README.md](e2e/README.md) to run the Playwright + axe-core browser suite. (Note: `examples/demo` and `e2e/` track `main` / `egui 0.37`.)
+See [examples/demo/README.md](examples/demo/README.md) to run the interactive `eframe` demo in the browser or natively, and [e2e/README.md](e2e/README.md) to run the Playwright + axe-core browser suite.
 
 ## Known Limitations
 
 - **`egui 0.35` / `0.36` upstream coverage:** On `egui 0.35` and `0.36`, `egui` itself does not yet handle `Action::SetValue` / `Action::ReplaceSelectedText` on `TextEdit`, emit `is_expanded` on `CollapsingHeader`, or emit `read_only` on `&str` `TextEdit`; text reading, focus, scroll actions, buttons, checkboxes, and sliders work on `0.35`/`0.36`, while remote DOM text editing, `readonly` from `&str`, and `aria-expanded` require `egui 0.37`.
 - **IME composition:** `eframe`'s internal `TextAgent` IME flow is independent of the mirrored DOM text inputs.
-- **Role coverage:** Core interactive controls (`Button`, `DisclosureTriangle`, `Tab`, `MenuItem`, `CheckBox` including mixed tri-state, `Switch`, `RadioButton`, `Slider` stepped and unstepped, `SpinButton` / `DragValue`, single-line, multiline, and password `TextEdit`, `Label`, `Link`, `Window`, `Dialog`, `Alert`, headings with `aria-level`, lists, and regions) are mapped to semantic HTML/ARIA elements; complex grids/tables remain simplified.
+- **Role coverage:** Core interactive controls (`Button` including toggle `aria-pressed`, `DisclosureTriangle`, `Tab`/`TabList`, `MenuItem`/`MenuItemCheckBox`/`MenuItemRadio`, `CheckBox` including mixed tri-state, `Switch`, `RadioButton`/`RadioGroup`, `ComboBox`/`EditableComboBox` with `ListBox`/`option`, `Slider` stepped and unstepped, `SpinButton` / `DragValue`, `ProgressIndicator`, single-line, multiline, and password `TextEdit`, `Label`, `Link`, `Window`, `Dialog`/`AlertDialog` with `aria-modal`, `Alert`/`Status` with `aria-live`, headings with `aria-level`, lists, and regions) are mapped to semantic HTML/ARIA elements; complex grids/tables remain simplified.
