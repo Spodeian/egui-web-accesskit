@@ -1,5 +1,8 @@
-use accesskit::{Action, ActionData, ActionRequest, NodeId, Rect, Role, Toggled, TreeId, TreeUpdate};
-use accesskit_consumer::{FilterResult, NodeRef, Tree, TreeChangeHandler};
+use crate::accesskit_consumer::{FilterResult, Tree, TreeChangeHandler};
+use crate::egui::accesskit::{
+    Action, ActionData, ActionRequest, NodeId, Rect, Role, Toggled, TreeId, TreeUpdate,
+};
+use crate::ConsumerNode;
 
 /// Semantic HTML element tag chosen for an AccessKit node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,12 +44,15 @@ pub struct DomNodeSpec {
     pub input_type: Option<&'static str>,
     pub label: Option<String>,
     pub value: Option<String>,
-    pub checked: Option<bool>,
+    pub toggled: Option<Toggled>,
+    pub expanded: Option<bool>,
+    pub clickable: bool,
     pub disabled: bool,
     pub focusable: bool,
     pub numeric_value: Option<f64>,
     pub numeric_min: Option<f64>,
     pub numeric_max: Option<f64>,
+    pub numeric_step: Option<f64>,
     pub bounds: Option<Rect>,
 }
 
@@ -59,22 +65,16 @@ pub enum DomOp {
     SetFocus(Option<NodeId>),
 }
 
-/// Maps an [`accesskit_consumer::NodeRef`] into a [`DomNodeSpec`].
-pub fn map_node(node: &NodeRef<'_>) -> DomNodeSpec {
+/// Maps an AccessKit consumer node into a [`DomNodeSpec`].
+pub fn map_node(node: &ConsumerNode<'_>) -> DomNodeSpec {
     let (tag, aria_role, input_type) = map_role(node.role());
 
     let label = node.label().filter(|s| !s.is_empty());
-    // `NodeRef::value()` skips text-range extraction on multiline text inputs, so
+    // `value()` skips text-range extraction on multiline text inputs, so
     // fall back to the raw value string when present.
     let value = node
         .value()
         .or_else(|| node.raw_value().map(str::to_owned));
-
-    let checked = node.toggled().and_then(|toggled| match toggled {
-        Toggled::True => Some(true),
-        Toggled::False => Some(false),
-        Toggled::Mixed => None,
-    });
 
     DomNodeSpec {
         id: node.locate().0,
@@ -83,12 +83,15 @@ pub fn map_node(node: &NodeRef<'_>) -> DomNodeSpec {
         input_type,
         label,
         value,
-        checked,
+        toggled: node.toggled(),
+        expanded: node.data().is_expanded(),
+        clickable: node.is_clickable(&|_| FilterResult::Include),
         disabled: node.is_disabled(),
         focusable: node.is_focusable(&|_| FilterResult::Include),
         numeric_value: node.numeric_value(),
         numeric_min: node.min_numeric_value(),
         numeric_max: node.max_numeric_value(),
+        numeric_step: node.numeric_value_step(),
         bounds: (!node.is_hidden())
             .then(|| node.bounding_box())
             .flatten(),
@@ -97,7 +100,11 @@ pub fn map_node(node: &NodeRef<'_>) -> DomNodeSpec {
 
 fn map_role(role: Role) -> (DomTag, Option<&'static str>, Option<&'static str>) {
     match role {
-        Role::Button | Role::DefaultButton => (DomTag::Button, None, None),
+        Role::Button | Role::DefaultButton | Role::DisclosureTriangle => {
+            (DomTag::Button, None, None)
+        }
+        Role::Tab => (DomTag::Button, Some("tab"), None),
+        Role::MenuItem => (DomTag::Button, Some("menuitem"), None),
         Role::CheckBox => (DomTag::Input, Some("checkbox"), Some("checkbox")),
         Role::Switch => (DomTag::Input, Some("switch"), Some("checkbox")),
         Role::RadioButton => (DomTag::Input, Some("radio"), Some("radio")),
@@ -131,14 +138,14 @@ fn map_role(role: Role) -> (DomTag, Option<&'static str>, Option<&'static str>) 
     }
 }
 
-fn should_skip_node(node: &NodeRef<'_>) -> bool {
+fn should_skip_node(node: &ConsumerNode<'_>) -> bool {
     // egui emits inline TextRun children inside Labels and TextEdits whose text is
     // already carried on the parent node; mirroring them breaks <input> void tags
     // and duplicates label text for screen readers.
     node.role() == Role::TextRun
 }
 
-fn collect_dom_children(node: &NodeRef<'_>) -> Vec<NodeId> {
+fn collect_dom_children(node: &ConsumerNode<'_>) -> Vec<NodeId> {
     node.children()
         .filter(|child| !should_skip_node(child))
         .map(|child| child.locate().0)
@@ -235,7 +242,7 @@ impl DeltaCollector {
 }
 
 impl TreeChangeHandler for DeltaCollector {
-    fn node_added(&mut self, node: &NodeRef<'_>) {
+    fn node_added(&mut self, node: &ConsumerNode<'_>) {
         if should_skip_node(node) {
             return;
         }
@@ -249,7 +256,7 @@ impl TreeChangeHandler for DeltaCollector {
         }
     }
 
-    fn node_updated(&mut self, old_node: &NodeRef<'_>, new_node: &NodeRef<'_>) {
+    fn node_updated(&mut self, old_node: &ConsumerNode<'_>, new_node: &ConsumerNode<'_>) {
         if should_skip_node(new_node) {
             return;
         }
@@ -268,7 +275,11 @@ impl TreeChangeHandler for DeltaCollector {
         }
     }
 
-    fn focus_moved(&mut self, _old_node: Option<&NodeRef<'_>>, new_node: Option<&NodeRef<'_>>) {
+    fn focus_moved(
+        &mut self,
+        _old_node: Option<&ConsumerNode<'_>>,
+        new_node: Option<&ConsumerNode<'_>>,
+    ) {
         self.focus_change = Some(
             new_node
                 .filter(|node| !should_skip_node(node))
@@ -276,7 +287,7 @@ impl TreeChangeHandler for DeltaCollector {
         );
     }
 
-    fn node_removed(&mut self, node: &NodeRef<'_>) {
+    fn node_removed(&mut self, node: &ConsumerNode<'_>) {
         if should_skip_node(node) {
             return;
         }
@@ -324,9 +335,32 @@ pub fn set_numeric_value_action(target_node: NodeId, value: f64) -> ActionReques
     }
 }
 
+/// Builds an AccessKit [`Action::Increment`] request for the root tree.
+pub fn increment_action(target_node: NodeId) -> ActionRequest {
+    ActionRequest {
+        action: Action::Increment,
+        target_tree: TreeId::ROOT,
+        target_node,
+        data: None,
+    }
+}
+
+/// Builds an AccessKit [`Action::Decrement`] request for the root tree.
+pub fn decrement_action(target_node: NodeId) -> ActionRequest {
+    ActionRequest {
+        action: Action::Decrement,
+        target_tree: TreeId::ROOT,
+        target_node,
+        data: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
+    use crate::egui;
 
     fn find_upsert<'a>(ops: &'a [DomOp], pred: impl Fn(&DomNodeSpec) -> bool) -> &'a DomNodeSpec {
         ops.iter()
@@ -338,20 +372,31 @@ mod tests {
     }
 
     #[test]
-    fn maps_egui_widgets_to_dom_specs() {
+    fn maps_egui_widgets_to_dom_specs_and_excludes_text_runs() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
 
         let mut checked = true;
-        let mut slider_val = 42.0_f64;
+        let mut tri_checked = false;
+        let mut opacity = 0.35_f64;
+        let mut volume = 45.0_f64;
         let mut text = String::from("hello");
 
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             let _ = ui.button("Save");
             ui.checkbox(&mut checked, "Agree");
-            ui.add(egui::Slider::new(&mut slider_val, 0.0..=100.0).text("Volume"));
+            ui.add(egui::Checkbox::new(&mut tri_checked, "Mixed").indeterminate(true));
+            ui.add(egui::Slider::new(&mut opacity, 0.0..=1.0).text("Opacity"));
+            ui.add(
+                egui::Slider::new(&mut volume, 0.0..=100.0)
+                    .step_by(5.0)
+                    .text("Volume"),
+            );
             ui.label("Status text");
             ui.text_edit_singleline(&mut text);
+            egui::CollapsingHeader::new("Advanced details").show(ui, |ui| {
+                ui.label("Hidden");
+            });
         });
 
         let update = output
@@ -364,9 +409,28 @@ mod tests {
         let mut bridge = TreeBridge::new();
         let ops = bridge.apply_update(update);
 
+        let upserted_ids: HashSet<NodeId> = ops
+            .iter()
+            .filter_map(|op| match op {
+                DomOp::Upsert(spec) => Some(spec.id),
+                _ => None,
+            })
+            .collect();
+        for op in &ops {
+            if let DomOp::SetChildren { children, .. } = op {
+                for child in children {
+                    assert!(
+                        upserted_ids.contains(child),
+                        "SetChildren contains skipped node {child:?}"
+                    );
+                }
+            }
+        }
+
         let button = find_upsert(&ops, |s| {
             s.tag == DomTag::Button && s.label.as_deref() == Some("Save")
         });
+        assert!(button.clickable);
         assert!(button.focusable);
         assert!(!button.disabled);
         assert!(button.bounds.is_some());
@@ -376,16 +440,26 @@ mod tests {
         });
         assert_eq!(checkbox.tag, DomTag::Input);
         assert_eq!(checkbox.input_type, Some("checkbox"));
-        assert_eq!(checkbox.checked, Some(true));
+        assert_eq!(checkbox.toggled, Some(Toggled::True));
 
-        let slider = find_upsert(&ops, |s| {
+        let mixed = find_upsert(&ops, |s| {
+            s.aria_role == Some("checkbox") && s.label.as_deref() == Some("Mixed")
+        });
+        assert_eq!(mixed.toggled, Some(Toggled::Mixed));
+
+        let opacity_slider = find_upsert(&ops, |s| {
+            s.aria_role == Some("slider") && s.label.as_deref() == Some("Opacity")
+        });
+        assert_eq!(opacity_slider.numeric_value, Some(0.35));
+        assert_eq!(opacity_slider.numeric_min, Some(0.0));
+        assert_eq!(opacity_slider.numeric_max, Some(1.0));
+        assert_eq!(opacity_slider.numeric_step, None);
+
+        let volume_slider = find_upsert(&ops, |s| {
             s.aria_role == Some("slider") && s.label.as_deref() == Some("Volume")
         });
-        assert_eq!(slider.tag, DomTag::Input);
-        assert_eq!(slider.input_type, Some("range"));
-        assert_eq!(slider.numeric_value, Some(42.0));
-        assert_eq!(slider.numeric_min, Some(0.0));
-        assert_eq!(slider.numeric_max, Some(100.0));
+        assert_eq!(volume_slider.numeric_value, Some(45.0));
+        assert_eq!(volume_slider.numeric_step, Some(5.0));
 
         let label = find_upsert(&ops, |s| {
             s.tag == DomTag::Span && s.value.as_deref() == Some("Status text")
@@ -396,6 +470,15 @@ mod tests {
             s.tag == DomTag::Input && s.input_type == Some("text")
         });
         assert_eq!(text_input.value.as_deref(), Some("hello"));
+
+        let disclosure = find_upsert(&ops, |s| {
+            s.tag == DomTag::Button && s.label.as_deref() == Some("Advanced details")
+        });
+        assert!(disclosure.clickable);
+        #[cfg(feature = "egui-037")]
+        assert_eq!(disclosure.expanded, Some(false));
+        #[cfg(feature = "egui-036")]
+        assert_eq!(disclosure.expanded, None);
     }
 
     #[test]
@@ -432,7 +515,7 @@ mod tests {
         let updated_checkbox = find_upsert(&ops2, |s| {
             s.aria_role == Some("checkbox") && s.label.as_deref() == Some("Subscribe")
         });
-        assert_eq!(updated_checkbox.checked, Some(true));
+        assert_eq!(updated_checkbox.toggled, Some(Toggled::True));
 
         assert!(
             ops2.iter().any(|op| *op == DomOp::Remove(temp_id)),
@@ -441,28 +524,95 @@ mod tests {
     }
 
     #[test]
-    fn action_request_round_trips_click_into_egui() {
+    fn action_requests_round_trip_into_egui() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
 
         let mut bridge = TreeBridge::new();
+        let mut volume = 50.0_f64;
+        let mut note = String::from("abc");
         let mut out1 = ctx.run_ui(egui::RawInput::default(), |ui| {
             let _ = ui.button("Trigger");
+            ui.add(
+                egui::Slider::new(&mut volume, 0.0..=100.0)
+                    .step_by(5.0)
+                    .text("Volume"),
+            );
+            ui.text_edit_singleline(&mut note);
+            egui::CollapsingHeader::new("Details").show(ui, |ui| {
+                ui.label("Inside");
+            });
         });
         let ops1 = bridge.apply_update(out1.platform_output.accesskit_update.take().unwrap());
         out1.drop_without_applying_deltas();
+
         let button_id = find_upsert(&ops1, |s| s.label.as_deref() == Some("Trigger")).id;
+        let slider_id = find_upsert(&ops1, |s| s.label.as_deref() == Some("Volume")).id;
+        let text_id = find_upsert(&ops1, |s| {
+            s.tag == DomTag::Input && s.input_type == Some("text")
+        })
+        .id;
+        let disclosure_id = find_upsert(&ops1, |s| s.label.as_deref() == Some("Details")).id;
 
         let mut clicked = false;
-        let input = egui::RawInput {
-            events: vec![egui::Event::AccessKitActionRequest(click_action(button_id))],
+        let mut text_focused = false;
+        let input2 = egui::RawInput {
+            events: vec![
+                egui::Event::AccessKitActionRequest(click_action(button_id)),
+                egui::Event::AccessKitActionRequest(click_action(disclosure_id)),
+                egui::Event::AccessKitActionRequest(set_numeric_value_action(slider_id, 60.0)),
+                egui::Event::AccessKitActionRequest(focus_action(text_id)),
+                egui::Event::AccessKitActionRequest(set_value_action(
+                    text_id,
+                    String::from("updated"),
+                )),
+            ],
             ..Default::default()
         };
-        let out2 = ctx.run_ui(input, |ui| {
+        let mut out2 = ctx.run_ui(input2, |ui| {
             clicked = ui.button("Trigger").clicked();
+            ui.add(
+                egui::Slider::new(&mut volume, 0.0..=100.0)
+                    .step_by(5.0)
+                    .text("Volume"),
+            );
+            text_focused = ui.text_edit_singleline(&mut note).has_focus();
+            egui::CollapsingHeader::new("Details").show(ui, |ui| {
+                ui.label("Inside");
+            });
         });
+        let ops2 = bridge.apply_update(out2.platform_output.accesskit_update.take().unwrap());
         out2.drop_without_applying_deltas();
 
         assert!(clicked, "AccessKit click action must trigger egui button");
+        assert!(text_focused, "AccessKit focus action must focus TextEdit");
+        assert_eq!(volume, 60.0);
+
+        #[cfg(feature = "egui-037")]
+        {
+            assert_eq!(note, "updated");
+            let disclosure_after =
+                find_upsert(&ops2, |s| s.label.as_deref() == Some("Details"));
+            assert_eq!(disclosure_after.expanded, Some(true));
+        }
+        #[cfg(feature = "egui-036")]
+        let _ = (&note, &ops2);
+
+        let input3 = egui::RawInput {
+            events: vec![egui::Event::AccessKitActionRequest(increment_action(
+                slider_id,
+            ))],
+            ..Default::default()
+        };
+        let out3 = ctx.run_ui(input3, |ui| {
+            let _ = ui.button("Trigger");
+            ui.add(
+                egui::Slider::new(&mut volume, 0.0..=100.0)
+                    .step_by(5.0)
+                    .text("Volume"),
+            );
+        });
+        out3.drop_without_applying_deltas();
+        assert_eq!(volume, 65.0);
     }
 }

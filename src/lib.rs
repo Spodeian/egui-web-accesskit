@@ -1,3 +1,25 @@
+#[cfg(all(feature = "egui-036", feature = "egui-037"))]
+compile_error!(
+    "Enable at most one of `egui-036` or `egui-037` (for egui 0.36 use `default-features = false, features = [\"egui-036\"]`)."
+);
+
+#[cfg(not(any(feature = "egui-036", feature = "egui-037")))]
+compile_error!("Enable either the `egui-036` or `egui-037` feature on `egui-web-accesskit`.");
+
+#[cfg(feature = "egui-036")]
+pub(crate) use accesskit_consumer_038 as accesskit_consumer;
+#[cfg(feature = "egui-036")]
+pub(crate) use egui_036 as egui;
+#[cfg(feature = "egui-036")]
+pub(crate) type ConsumerNode<'a> = accesskit_consumer::Node<'a>;
+
+#[cfg(feature = "egui-037")]
+pub(crate) use accesskit_consumer_039 as accesskit_consumer;
+#[cfg(feature = "egui-037")]
+pub(crate) use egui_037 as egui;
+#[cfg(feature = "egui-037")]
+pub(crate) type ConsumerNode<'a> = accesskit_consumer::NodeRef<'a>;
+
 pub mod mapper;
 
 #[cfg(target_arch = "wasm32")]
@@ -57,6 +79,28 @@ impl WebAccessKitPlugin {
         }
     }
 
+    /// Creates a plugin bound directly to a `<canvas>` element (works inside a Shadow DOM).
+    #[cfg(target_arch = "wasm32")]
+    pub fn from_canvas(canvas: web_sys::HtmlCanvasElement) -> Self {
+        let plugin = Self::new(canvas.id());
+        dom::stash_pending_canvas(plugin.bridge_id, canvas);
+        plugin
+    }
+
+    /// Tears down the DOM bridge and breaks the `Context` repaint-wakeup reference cycle.
+    ///
+    /// Useful when unmounting an `egui::Context` on `egui 0.36` (which lacks `Plugin::on_exit`)
+    /// or outside `eframe`'s `destroy()` lifecycle.
+    pub fn teardown(ctx: &egui::Context) {
+        #[cfg(target_arch = "wasm32")]
+        if let Some(plugin) = ctx.plugin_opt::<Self>() {
+            let bridge_id = plugin.lock().bridge_id;
+            dom::remove_bridge(bridge_id);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = ctx;
+    }
+
     /// Returns the plugin configuration.
     pub fn config(&self) -> &WebAccessKitConfig {
         &self.config
@@ -87,15 +131,24 @@ impl egui::Plugin for WebAccessKitPlugin {
 
         let wakeup_ctx = ctx.clone();
         let wakeup = Box::new(move || wakeup_ctx.request_repaint());
-        if let Some(bridge) =
-            dom::WebDomBridge::mount(&self.config.canvas_id, Arc::clone(&self.queue), wakeup)
-        {
+        if let Some(bridge) = dom::WebDomBridge::mount(
+            self.bridge_id,
+            &self.config.canvas_id,
+            Arc::clone(&self.queue),
+            wakeup,
+        ) {
             dom::insert_bridge(self.bridge_id, bridge);
         }
     }
 
     #[cfg(target_arch = "wasm32")]
     fn input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
+        if dom::has_dom_focus(self.bridge_id) {
+            input.focused = true;
+            input
+                .events
+                .retain(|event| !matches!(event, egui::Event::WindowFocused(false)));
+        }
         if let Ok(mut pending) = self.queue.lock()
             && !pending.is_empty()
         {
@@ -105,16 +158,20 @@ impl egui::Plugin for WebAccessKitPlugin {
 
     #[cfg(target_arch = "wasm32")]
     fn output_hook(&mut self, ctx: &egui::Context, output: &mut egui::FullOutput) {
-        let Some(update) = output.platform_output.accesskit_update.take() else {
+        if output.platform_output.requested_discard()
+            && output.platform_output.num_completed_passes < ctx.options(|o| o.max_passes.get())
+        {
+            return;
+        }
+        let Some(update) = output.platform_output.accesskit_update.clone() else {
             return;
         };
-        let pixels_per_point = ctx.pixels_per_point();
         dom::with_bridge_mut(self.bridge_id, |bridge| {
-            bridge.apply_update(update, pixels_per_point);
+            bridge.apply_update(update);
         });
     }
 
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(target_arch = "wasm32", feature = "egui-037"))]
     fn on_exit(&mut self, _ctx: &egui::Context) {
         dom::remove_bridge(self.bridge_id);
     }
@@ -137,5 +194,6 @@ mod tests {
         assert!(!clicked);
         assert!(!output.shapes.is_empty());
         output.drop_without_applying_deltas();
+        WebAccessKitPlugin::teardown(&ctx);
     }
 }

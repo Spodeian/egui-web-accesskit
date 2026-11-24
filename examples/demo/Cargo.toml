@@ -5,7 +5,13 @@ edition = "2024"
 publish = false
 
 [dependencies]
-eframe = "0.37.0"
+eframe = { version = "0.37.0", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
 egui = "0.37.0"
 egui-web-accesskit = { path = "../.." }
 

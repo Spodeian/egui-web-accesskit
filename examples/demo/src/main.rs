@@ -4,6 +4,9 @@ use egui_web_accesskit::WebAccessKitPlugin;
 struct DemoApp {
     clicks: u32,
     accepted: bool,
+    tri_checked: bool,
+    tri_indeterminate: bool,
+    opacity: f64,
     volume: f64,
     note: String,
 }
@@ -13,6 +16,9 @@ impl Default for DemoApp {
         Self {
             clicks: 0,
             accepted: false,
+            tri_checked: false,
+            tri_indeterminate: true,
+            opacity: 0.35,
             volume: 50.0,
             note: String::from("Type here"),
         }
@@ -29,13 +35,46 @@ impl eframe::App for DemoApp {
                 self.clicks += 1;
             }
 
-            ui.checkbox(&mut self.accepted, "Enable notifications");
-            ui.add(egui::Slider::new(&mut self.volume, 0.0..=100.0).text("Volume"));
+            if ui.button("Zoom 1.5x").clicked() {
+                ui.ctx().set_zoom_factor(1.5);
+            }
 
-            ui.horizontal(|ui| {
-                let label = ui.label("Note:");
-                ui.text_edit_singleline(&mut self.note)
-                    .labelled_by(label.id);
+            ui.checkbox(&mut self.accepted, "Enable notifications");
+            if ui
+                .add(
+                    egui::Checkbox::new(&mut self.tri_checked, "Tri-state option")
+                        .indeterminate(self.tri_indeterminate),
+                )
+                .clicked()
+            {
+                self.tri_indeterminate = false;
+            }
+
+            ui.add(egui::Slider::new(&mut self.opacity, 0.0..=1.0).text("Opacity"));
+            ui.add(
+                egui::Slider::new(&mut self.volume, 0.0..=100.0)
+                    .step_by(5.0)
+                    .text("Volume"),
+            );
+
+            if self.note.starts_with('!') {
+                ui.label("Warning banner");
+            }
+
+            let note_row_id = ui.make_persistent_id("note_row");
+            ui.scope_builder(egui::UiBuilder::new().scope_id(note_row_id), |ui| {
+                    ui.horizontal(|ui| {
+                        let label = ui.label("Note:");
+                        ui.text_edit_singleline(&mut self.note)
+                            .labelled_by(label.id);
+                        if ui.button("Clear note").clicked() {
+                            self.note.clear();
+                        }
+                    });
+                });
+
+            egui::CollapsingHeader::new("Advanced details").show(ui, |ui| {
+                ui.label("Hidden detail text");
             });
         });
     }

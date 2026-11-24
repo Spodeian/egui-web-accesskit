@@ -8,10 +8,16 @@ readme = "README.md"
 keywords = ["egui", "accesskit", "accessibility", "wasm", "web"]
 categories = ["accessibility", "gui", "wasm"]
 
+[features]
+default = ["egui-037"]
+egui-036 = ["dep:egui_036", "dep:accesskit_consumer_038"]
+egui-037 = ["dep:egui_037", "dep:accesskit_consumer_039"]
+
 [dependencies]
-accesskit = "0.25"
-accesskit_consumer = "0.39.2"
-egui = { version = "0.37.0", default-features = false }
+accesskit_consumer_038 = { package = "accesskit_consumer", version = "0.38", optional = true }
+accesskit_consumer_039 = { package = "accesskit_consumer", version = "0.39", optional = true }
+egui_036 = { package = "egui", version = "0.36", default-features = false, optional = true }
+egui_037 = { package = "egui", version = "0.37", default-features = false, optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
@@ -22,10 +28,12 @@ web-sys = { version = "0.3", features = [
     "Element",
     "Event",
     "EventTarget",
-    "FocusEvent",
+    "FocusOptions",
+    "HtmlCanvasElement",
     "HtmlElement",
     "HtmlInputElement",
     "KeyboardEvent",
     "Node",
+    "ShadowRoot",
     "Window",
 ] }
