@@ -1,3 +1,44 @@
+//! Drop-in [`egui::Plugin`] that mirrors `egui`'s AccessKit tree to an HTML/ARIA DOM overlay on `wasm32`.
+//!
+//! `eframe` on the web does not wire AccessKit updates to browser DOM elements on its own.
+//! Registering [`WebAccessKitPlugin`] once during setup bridges `egui`'s AccessKit output to
+//! screen readers and assistive technologies without modifying `egui` or `eframe`, while becoming
+//! a clean no-op on native desktop targets.
+//!
+//! # Version Compatibility
+//!
+//! Each branch/release matches `egui`'s minor version:
+//!
+//! | `egui` / `eframe` | `egui-web-accesskit` | Branch |
+//! | --- | --- | --- |
+//! | `0.37` | `0.37` | `main` |
+//! | `0.36` | `0.36` | `egui-0.36` |
+//! | `0.35` | `0.35` | `egui-0.35` |
+//!
+//! # Setup with `eframe`
+//!
+//! ```ignore
+//! eframe::WebRunner::new().start(
+//!     canvas,
+//!     web_options,
+//!     Box::new(|cc| {
+//!         cc.egui_ctx
+//!             .add_plugin(egui_web_accesskit::WebAccessKitPlugin::new("the_canvas_id"));
+//!         Ok(Box::new(MyApp::default()))
+//!     }),
+//! );
+//! ```
+//!
+//! # Shadow DOM & Manual Teardown
+//!
+//! - When `<canvas>` lives inside a `ShadowRoot`, construct the plugin with
+//!   `WebAccessKitPlugin::from_canvas(canvas)` on `wasm32`.
+//! - When tearing down an `egui::Context` outside `eframe::WebRunner::destroy` (or on earlier
+//!   `egui` versions without `Plugin::on_exit`), call [`WebAccessKitPlugin::teardown`] to detach
+//!   all DOM listeners and break the repaint-wakeup reference cycle.
+
+#![warn(missing_docs)]
+
 pub mod mapper;
 
 #[cfg(target_arch = "wasm32")]
@@ -21,6 +62,7 @@ pub struct WebAccessKitConfig {
 }
 
 impl WebAccessKitConfig {
+    /// Creates a [`WebAccessKitConfig`] targeting the DOM element with `canvas_id`.
     pub fn new(canvas_id: impl Into<String>) -> Self {
         Self {
             canvas_id: canvas_id.into(),
@@ -32,6 +74,21 @@ impl WebAccessKitConfig {
 ///
 /// On non-`wasm32` targets this plugin is a no-op so native desktop builds continue using
 /// `eframe` / `egui-winit`'s built-in platform adapters unchanged.
+///
+/// # Example
+///
+/// ```
+/// use egui_web_accesskit::WebAccessKitPlugin;
+///
+/// let ctx = egui::Context::default();
+/// ctx.add_plugin(WebAccessKitPlugin::new("the_canvas_id"));
+///
+/// let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+///     let _ = ui.button("OK");
+/// });
+/// output.drop_without_applying_deltas();
+/// WebAccessKitPlugin::teardown(&ctx);
+/// ```
 pub struct WebAccessKitPlugin {
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     bridge_id: u64,

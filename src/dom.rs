@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -13,8 +13,8 @@ use web_sys::{
 use egui::accesskit::{Action, ActionRequest, Live, NodeId, Rect, Toggled};
 use crate::mapper::{
     DomNodeSpec, DomOp, DomTag, TreeBridge, click_action, decrement_action, focus_action,
-    increment_action, scroll_action, scroll_into_view_action, set_numeric_value_action,
-    set_value_action,
+    increment_action, replace_selected_text_action, scroll_action, scroll_into_view_action,
+    set_numeric_value_action, set_value_action,
 };
 
 pub(crate) enum PendingDomEvent {
@@ -26,7 +26,38 @@ pub(crate) enum PendingDomEvent {
     },
 }
 
+impl PendingDomEvent {
+    fn target_node(&self) -> NodeId {
+        match self {
+            Self::Action(req) => req.target_node,
+            Self::TextSelection { target_node, .. } => *target_node,
+        }
+    }
+
+    fn is_text_mutation(&self) -> bool {
+        matches!(
+            self,
+            Self::Action(req)
+                if matches!(req.action, Action::SetValue | Action::ReplaceSelectedText)
+        )
+    }
+
+    fn targets_text_state(&self, node: NodeId) -> bool {
+        if self.target_node() != node {
+            return false;
+        }
+        match self {
+            Self::TextSelection { .. } => true,
+            Self::Action(req) => matches!(
+                req.action,
+                Action::SetValue | Action::ReplaceSelectedText | Action::SetTextSelection
+            ),
+        }
+    }
+}
+
 pub(crate) type ActionQueue = Arc<Mutex<Vec<PendingDomEvent>>>;
+type RepaintWakeup = Rc<RefCell<Option<Box<dyn Fn()>>>>;
 
 thread_local! {
     static BRIDGES: RefCell<HashMap<u64, WebDomBridge>> = RefCell::new(HashMap::new());
@@ -141,6 +172,9 @@ impl InteractionKind {
                 Some("range") => Self::Numeric {
                     unstepped: spec.numeric_step.is_none(),
                 },
+                Some("number") if spec.aria_role == Some("spinbutton") => Self::Numeric {
+                    unstepped: spec.numeric_step.is_none(),
+                },
                 _ => Self::Text,
             },
             DomTag::TextArea => Self::Text,
@@ -162,9 +196,10 @@ pub(crate) struct WebDomBridge {
     listeners: HashMap<NodeId, Vec<AttachedListener>>,
     viewport_listeners: Vec<AttachedListener>,
     queue: ActionQueue,
-    repaint_wakeup: Rc<RefCell<Option<Box<dyn Fn()>>>>,
+    repaint_wakeup: RepaintWakeup,
     syncing_focus: Rc<Cell<bool>>,
     syncing_selection: Rc<Cell<bool>>,
+    dom_owned_selection: Rc<RefCell<HashSet<NodeId>>>,
     last_canvas_rect: Option<(f64, f64, f64, f64)>,
     last_dpr: Option<f64>,
 }
@@ -191,8 +226,16 @@ impl WebDomBridge {
         });
 
         let container = document.create_element("div").ok()?;
+        let container_label = canvas
+            .as_ref()
+            .and_then(|c| c.get_attribute("aria-label"))
+            .filter(|s| !s.is_empty());
         let _ = container.set_attribute("data-egui-accesskit", "true");
         let _ = container.set_attribute("role", "application");
+        let _ = container.set_attribute(
+            "aria-label",
+            container_label.as_deref().unwrap_or("Application"),
+        );
         if let Some(html) = container.dyn_ref::<HtmlElement>() {
             let style = html.style();
             let _ = style.set_property("position", "fixed");
@@ -228,6 +271,7 @@ impl WebDomBridge {
             repaint_wakeup: Rc::new(RefCell::new(Some(wakeup))),
             syncing_focus: Rc::new(Cell::new(false)),
             syncing_selection: Rc::new(Cell::new(false)),
+            dom_owned_selection: Rc::new(RefCell::new(HashSet::new())),
             last_canvas_rect: None,
             last_dpr: None,
         };
@@ -317,9 +361,16 @@ impl WebDomBridge {
         *self.repaint_wakeup.borrow_mut() = None;
         self.viewport_listeners.clear();
         self.listeners.clear();
+        self.dom_owned_selection.borrow_mut().clear();
         self.elements.clear();
         self.specs.clear();
         self.container.remove();
+    }
+
+    fn has_pending_text_event(&self, id: NodeId) -> bool {
+        self.queue
+            .lock()
+            .is_ok_and(|q| q.iter().any(|ev| ev.targets_text_state(id)))
     }
 
     fn reapply_all_bounds(&self, dpr: f64, canvas_origin: (f64, f64)) {
@@ -371,6 +422,7 @@ impl WebDomBridge {
         let tag_changed = old_spec.is_some_and(|old| element_tag_name(old) != desired_tag);
         let needs_rebind = old_spec.is_none_or(|old| {
             element_tag_name(old) != desired_tag
+                || old.input_type != spec.input_type
                 || InteractionKind::from_spec(old) != InteractionKind::from_spec(&spec)
                 || old.focusable != spec.focusable
                 || old.disabled != spec.disabled
@@ -395,14 +447,34 @@ impl WebDomBridge {
             self.elements.get(&id).unwrap().clone()
         };
 
-        apply_dom_attributes(&element, &spec, dpr, canvas_origin);
+        let skip_text_sync = self.has_pending_text_event(id);
+        apply_dom_attributes(&element, &spec, dpr, canvas_origin, skip_text_sync);
 
-        if supports_dom_selection(&spec)
-            && let Some((anchor, focus)) = spec.text_selection
+        let dom_owned = if !skip_text_sync {
+            self.dom_owned_selection.borrow_mut().remove(&id)
+        } else {
+            false
+        };
+        if !skip_text_sync
+            && supports_dom_selection(&spec)
             && active_element_for(self.container.as_ref(), &self.document)
                 .is_some_and(|active| active == element)
         {
-            write_dom_selection(&element, anchor, focus, &self.syncing_selection);
+            if dom_owned {
+                if let Some((anchor_utf16, focus_utf16)) = read_dom_selection(&element)
+                    && spec.text_selection != Some((anchor_utf16, focus_utf16))
+                {
+                    queue_text_selection(
+                        &self.queue,
+                        &self.repaint_wakeup,
+                        id,
+                        anchor_utf16,
+                        focus_utf16,
+                    );
+                }
+            } else if let Some((anchor, focus)) = spec.text_selection {
+                write_dom_selection(&element, anchor, focus, &self.syncing_selection);
+            }
         }
 
         if Some(id) == self.tree.root_id() && element.parent_node().is_none() {
@@ -445,13 +517,65 @@ impl WebDomBridge {
                     let el_for_input = element.clone();
                     let queue = Arc::clone(&self.queue);
                     let wakeup = Rc::clone(&self.repaint_wakeup);
-                    if let Some(l) = add_listener(&target, "input", move |event| {
-                        event.stop_propagation();
-                        if let Some(val) = read_text_value(&el_for_input) {
-                            push_action(&queue, &wakeup, set_value_action(id, val));
+                    if spec.input_type == Some("password") {
+                        let prev_val = Rc::new(RefCell::new(
+                            read_text_value(element).unwrap_or_default(),
+                        ));
+                        let owned_selection = Rc::clone(&self.dom_owned_selection);
+                        for event_name in ["focus", "beforeinput"] {
+                            let el_snap = element.clone();
+                            let prev_snap = Rc::clone(&prev_val);
+                            if let Some(l) = add_listener(&target, event_name, move |_event| {
+                                if let Some(val) = read_text_value(&el_snap) {
+                                    *prev_snap.borrow_mut() = val;
+                                }
+                            }) {
+                                out.push(l);
+                            }
                         }
-                    }) {
-                        out.push(l);
+                        if let Some(l) = add_listener(&target, "input", move |event| {
+                            event.stop_propagation();
+                            let Some(new_val) = read_text_value(&el_for_input) else {
+                                return;
+                            };
+                            let mut prev = prev_val.borrow_mut();
+                            if new_val.chars().any(is_password_mask_char) {
+                                let (anchor_utf16, focus_utf16, inserted) =
+                                    password_diff_utf16(&prev, &new_val);
+                                *prev = new_val;
+                                if let Ok(mut guard) = queue.lock() {
+                                    guard.retain(|ev| !ev.targets_text_state(id));
+                                    guard.push(PendingDomEvent::TextSelection {
+                                        target_node: id,
+                                        anchor_utf16,
+                                        focus_utf16,
+                                    });
+                                    guard.push(PendingDomEvent::Action(
+                                        replace_selected_text_action(id, inserted),
+                                    ));
+                                }
+                                if let Some(cb) = wakeup.borrow().as_ref() {
+                                    cb();
+                                }
+                            } else {
+                                *prev = new_val.clone();
+                                owned_selection.borrow_mut().insert(id);
+                                push_coalesced_value(&queue, &wakeup, id, set_value_action(id, new_val));
+                            }
+                        }) {
+                            out.push(l);
+                        }
+                    } else {
+                        let owned_selection = Rc::clone(&self.dom_owned_selection);
+                        if let Some(l) = add_listener(&target, "input", move |event| {
+                            event.stop_propagation();
+                            if let Some(val) = read_text_value(&el_for_input) {
+                                owned_selection.borrow_mut().insert(id);
+                                push_coalesced_value(&queue, &wakeup, id, set_value_action(id, val));
+                            }
+                        }) {
+                            out.push(l);
+                        }
                     }
                 }
                 if let Some(l) = add_listener(&target, "keydown", |event| {
@@ -587,7 +711,7 @@ impl WebDomBridge {
         let mut scan = parent_node.first_child();
         while let Some(node) = scan {
             scan = node.next_sibling();
-            if !expected.iter().any(|wanted| *wanted == &node) {
+            if !expected.contains(&&node) {
                 let _ = parent_node.remove_child(&node);
             }
         }
@@ -605,6 +729,7 @@ impl WebDomBridge {
     fn remove_node(&mut self, id: NodeId) {
         self.listeners.remove(&id);
         self.specs.remove(&id);
+        self.dom_owned_selection.borrow_mut().remove(&id);
         if let Some(el) = self.elements.remove(&id) {
             el.remove();
         }
@@ -746,22 +871,97 @@ fn emit_dom_selection(
     id: NodeId,
     syncing_selection: &Cell<bool>,
     queue: &ActionQueue,
-    wakeup: &Rc<RefCell<Option<Box<dyn Fn()>>>>,
+    wakeup: &RepaintWakeup,
 ) {
     if syncing_selection.get() {
         return;
     }
     if let Some((anchor_utf16, focus_utf16)) = read_dom_selection(element) {
-        push_events(
-            queue,
-            wakeup,
-            [PendingDomEvent::TextSelection {
+        queue_text_selection(queue, wakeup, id, anchor_utf16, focus_utf16);
+    }
+}
+
+fn queue_text_selection(
+    queue: &ActionQueue,
+    wakeup: &RepaintWakeup,
+    id: NodeId,
+    anchor_utf16: usize,
+    focus_utf16: usize,
+) {
+    let pushed = if let Ok(mut guard) = queue.lock() {
+        if guard
+            .iter()
+            .any(|ev| ev.target_node() == id && ev.is_text_mutation())
+        {
+            false
+        } else {
+            guard.retain(|ev| {
+                !(ev.target_node() == id && matches!(ev, PendingDomEvent::TextSelection { .. }))
+            });
+            guard.push(PendingDomEvent::TextSelection {
                 target_node: id,
                 anchor_utf16,
                 focus_utf16,
-            }],
-        );
+            });
+            true
+        }
+    } else {
+        false
+    };
+    if pushed && let Some(cb) = wakeup.borrow().as_ref() {
+        cb();
     }
+}
+
+fn push_coalesced_value(
+    queue: &ActionQueue,
+    wakeup: &RepaintWakeup,
+    id: NodeId,
+    request: ActionRequest,
+) {
+    if let Ok(mut guard) = queue.lock() {
+        guard.retain(|ev| !ev.targets_text_state(id));
+        guard.push(PendingDomEvent::Action(request));
+    }
+    if let Some(cb) = wakeup.borrow().as_ref() {
+        cb();
+    }
+}
+
+fn safe_href(url: Option<&str>) -> &str {
+    match url {
+        Some(u)
+            if u.len() >= 8 && u[..8].eq_ignore_ascii_case("https://")
+                || u.len() >= 7 && u[..7].eq_ignore_ascii_case("http://")
+                || u.len() >= 7 && u[..7].eq_ignore_ascii_case("mailto:")
+                || u.starts_with('#') =>
+        {
+            u
+        }
+        _ => "#",
+    }
+}
+
+fn is_password_mask_char(c: char) -> bool {
+    matches!(c, '\u{25CF}' | '\u{2022}')
+}
+
+fn password_diff_utf16(old: &str, new: &str) -> (usize, usize, String) {
+    let old_u16: Vec<u16> = old.encode_utf16().collect();
+    let new_u16: Vec<u16> = new.encode_utf16().collect();
+    let min_len = old_u16.len().min(new_u16.len());
+    let mut prefix = 0;
+    while prefix < min_len && old_u16[prefix] == new_u16[prefix] {
+        prefix += 1;
+    }
+    let mut suffix = 0;
+    while prefix + suffix < min_len
+        && old_u16[old_u16.len() - 1 - suffix] == new_u16[new_u16.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    let inserted = String::from_utf16_lossy(&new_u16[prefix..new_u16.len() - suffix]);
+    (prefix, old_u16.len() - suffix, inserted)
 }
 
 fn apply_dom_attributes(
@@ -769,10 +969,36 @@ fn apply_dom_attributes(
     spec: &DomNodeSpec,
     dpr: f64,
     canvas_origin: (f64, f64),
+    skip_value_sync: bool,
 ) {
-    set_optional_attr(element, "role", spec.aria_role);
+    let base_role = match spec.aria_role {
+        Some("meter" | "scrollbar") if spec.numeric_value.is_none() => None,
+        other => other,
+    };
+    let effective_role = if base_role.is_none()
+        && spec.tag == DomTag::Div
+        && (spec.label.is_some() || spec.description.is_some())
+    {
+        Some("group")
+    } else {
+        base_role
+    };
+    let supports_range_aria = matches!(
+        effective_role,
+        Some("slider" | "spinbutton" | "progressbar" | "scrollbar" | "meter")
+    ) || matches!(spec.input_type, Some("range" | "number"));
+
+    set_optional_attr(element, "role", effective_role);
     set_optional_attr(element, "aria-label", spec.label.as_deref());
+    set_optional_attr(element, "aria-description", spec.description.as_deref());
     set_optional_attr(element, "placeholder", spec.placeholder.as_deref());
+    set_optional_attr(
+        element,
+        "aria-valuetext",
+        supports_range_aria
+            .then(|| spec.numeric_value.and(spec.value.as_deref()))
+            .flatten(),
+    );
 
     let heading_level = spec.heading_level.map(|n| n.to_string());
     set_optional_attr(element, "aria-level", heading_level.as_deref());
@@ -799,7 +1025,7 @@ fn apply_dom_attributes(
         if spec.disabled {
             let _ = element.remove_attribute("href");
         } else {
-            let _ = element.set_attribute("href", "#");
+            let _ = element.set_attribute("href", safe_href(spec.url.as_deref()));
         }
     }
 
@@ -874,17 +1100,26 @@ fn apply_dom_attributes(
     set_optional_attr(
         element,
         "aria-valuemin",
-        spec.numeric_min.map(|v| v.to_string()).as_deref(),
+        supports_range_aria
+            .then(|| spec.numeric_min.map(|v| v.to_string()))
+            .flatten()
+            .as_deref(),
     );
     set_optional_attr(
         element,
         "aria-valuemax",
-        spec.numeric_max.map(|v| v.to_string()).as_deref(),
+        supports_range_aria
+            .then(|| spec.numeric_max.map(|v| v.to_string()))
+            .flatten()
+            .as_deref(),
     );
     set_optional_attr(
         element,
         "aria-valuenow",
-        spec.numeric_value.map(|v| v.to_string()).as_deref(),
+        supports_range_aria
+            .then(|| spec.numeric_value.map(|v| v.to_string()))
+            .flatten()
+            .as_deref(),
     );
 
     if let Some(input_el) = element.dyn_ref::<HtmlInputElement>() {
@@ -913,36 +1148,49 @@ fn apply_dom_attributes(
                 input_el.set_indeterminate(false);
             }
         }
-        if spec.input_type == Some("range") {
+        if spec.input_type == Some("range") || spec.aria_role == Some("spinbutton") {
             let step_str = spec
                 .numeric_step
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| String::from("any"));
             input_el.set_step(&step_str);
-            if let Some(min) = spec.numeric_min {
-                input_el.set_min(&min.to_string());
-            }
-            if let Some(max) = spec.numeric_max {
-                input_el.set_max(&max.to_string());
-            }
+            set_optional_attr(
+                element,
+                "min",
+                spec.numeric_min.map(|v| v.to_string()).as_deref(),
+            );
+            set_optional_attr(
+                element,
+                "max",
+                spec.numeric_max.map(|v| v.to_string()).as_deref(),
+            );
             if let Some(val) = spec.numeric_value {
                 let s = val.to_string();
                 if input_el.value() != s {
                     input_el.set_value(&s);
                 }
             }
-        } else if !matches!(spec.input_type, Some("checkbox" | "radio")) {
+        } else if !matches!(spec.input_type, Some("checkbox" | "radio")) && !skip_value_sync {
             let val = spec.value.as_deref().unwrap_or("");
-            if input_el.value() != val {
+            if spec.input_type == Some("password") {
+                let current = input_el.value();
+                if current.chars().count() != val.chars().count()
+                    || (val.is_empty() && !current.is_empty())
+                {
+                    input_el.set_value(val);
+                }
+            } else if input_el.value() != val {
                 input_el.set_value(val);
             }
         }
     } else if let Some(textarea_el) = element.dyn_ref::<HtmlTextAreaElement>() {
         textarea_el.set_disabled(spec.disabled);
         textarea_el.set_read_only(spec.read_only);
-        let val = spec.value.as_deref().unwrap_or("");
-        if textarea_el.value() != val {
-            textarea_el.set_value(val);
+        if !skip_value_sync {
+            let val = spec.value.as_deref().unwrap_or("");
+            if textarea_el.value() != val {
+                textarea_el.set_value(val);
+            }
         }
     } else if matches!(
         spec.tag,
@@ -1048,7 +1296,7 @@ fn add_listener_with_options(
 
 fn push_action(
     queue: &ActionQueue,
-    wakeup: &Rc<RefCell<Option<Box<dyn Fn()>>>>,
+    wakeup: &RepaintWakeup,
     request: ActionRequest,
 ) {
     push_events(queue, wakeup, [PendingDomEvent::Action(request)]);
@@ -1056,7 +1304,7 @@ fn push_action(
 
 fn push_events(
     queue: &ActionQueue,
-    wakeup: &Rc<RefCell<Option<Box<dyn Fn()>>>>,
+    wakeup: &RepaintWakeup,
     events: impl IntoIterator<Item = PendingDomEvent>,
 ) {
     if let Ok(mut guard) = queue.lock() {

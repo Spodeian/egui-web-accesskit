@@ -1,12 +1,19 @@
 [package]
 name = "egui-web-accesskit"
-version = "0.36.0"
+version = "0.36.1"
 edition = "2024"
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 description = "Drop-in egui Plugin that mirrors AccessKit trees to the browser DOM on wasm32"
 readme = "README.md"
+repository = "https://github.com/Spodeian/egui-web-accesskit"
 keywords = ["egui", "accesskit", "accessibility", "wasm", "web"]
 categories = ["accessibility", "gui", "wasm"]
+exclude = ["/.github", "/e2e", "/examples"]
+
+[package.metadata.docs.rs]
+default-target = "wasm32-unknown-unknown"
+targets = ["wasm32-unknown-unknown", "x86_64-unknown-linux-gnu"]
 
 [dependencies]
 accesskit_consumer = "0.38"
