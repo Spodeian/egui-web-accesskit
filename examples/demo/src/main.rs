@@ -9,6 +9,7 @@ struct DemoApp {
     opacity: f64,
     volume: f64,
     note: String,
+    bio: String,
 }
 
 impl Default for DemoApp {
@@ -21,6 +22,7 @@ impl Default for DemoApp {
             opacity: 0.35,
             volume: 50.0,
             note: String::from("Type here"),
+            bio: String::from("Line 1"),
         }
     }
 }
@@ -28,7 +30,11 @@ impl Default for DemoApp {
 impl eframe::App for DemoApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading("egui-web-accesskit demo");
+            let heading = ui.heading("egui-web-accesskit demo");
+            ui.ctx().accesskit_node_builder(heading.id, |node| {
+                node.set_role(egui::accesskit::Role::Heading);
+                node.set_level(1);
+            });
             ui.label(format!("Button clicked {} times", self.clicks));
 
             if ui.button("Increment counter").clicked() {
@@ -75,6 +81,37 @@ impl eframe::App for DemoApp {
 
             egui::CollapsingHeader::new("Advanced details").show(ui, |ui| {
                 ui.label("Hidden detail text");
+            });
+
+            let bio_row_id = ui.make_persistent_id("bio_row");
+            ui.scope_builder(egui::UiBuilder::new().scope_id(bio_row_id), |ui| {
+                ui.horizontal(|ui| {
+                    let label = ui.label("Bio:");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.bio)
+                            .hint_text("Write bio")
+                            .desired_rows(2),
+                    )
+                    .labelled_by(label.id);
+                });
+            });
+
+            let token_row_id = ui.make_persistent_id("token_row");
+            ui.scope_builder(egui::UiBuilder::new().scope_id(token_row_id), |ui| {
+                ui.horizontal(|ui| {
+                    let label = ui.label("Token:");
+                    let mut token: &str = "RO-123";
+                    ui.text_edit_singleline(&mut token).labelled_by(label.id);
+                });
+            });
+
+            egui::ScrollArea::vertical().max_height(60.0).show(ui, |ui| {
+                for i in 0..8 {
+                    ui.label(format!("Item {i}"));
+                }
+                if ui.button("Bottom action").clicked() {
+                    self.clicks += 1;
+                }
             });
         });
     }

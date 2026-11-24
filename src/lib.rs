@@ -1,25 +1,3 @@
-#[cfg(all(feature = "egui-036", feature = "egui-037"))]
-compile_error!(
-    "Enable at most one of `egui-036` or `egui-037` (for egui 0.36 use `default-features = false, features = [\"egui-036\"]`)."
-);
-
-#[cfg(not(any(feature = "egui-036", feature = "egui-037")))]
-compile_error!("Enable either the `egui-036` or `egui-037` feature on `egui-web-accesskit`.");
-
-#[cfg(feature = "egui-036")]
-pub(crate) use accesskit_consumer_038 as accesskit_consumer;
-#[cfg(feature = "egui-036")]
-pub(crate) use egui_036 as egui;
-#[cfg(feature = "egui-036")]
-pub(crate) type ConsumerNode<'a> = accesskit_consumer::Node<'a>;
-
-#[cfg(feature = "egui-037")]
-pub(crate) use accesskit_consumer_039 as accesskit_consumer;
-#[cfg(feature = "egui-037")]
-pub(crate) use egui_037 as egui;
-#[cfg(feature = "egui-037")]
-pub(crate) type ConsumerNode<'a> = accesskit_consumer::NodeRef<'a>;
-
 pub mod mapper;
 
 #[cfg(target_arch = "wasm32")]
@@ -89,8 +67,7 @@ impl WebAccessKitPlugin {
 
     /// Tears down the DOM bridge and breaks the `Context` repaint-wakeup reference cycle.
     ///
-    /// Useful when unmounting an `egui::Context` on `egui 0.36` (which lacks `Plugin::on_exit`)
-    /// or outside `eframe`'s `destroy()` lifecycle.
+    /// Useful when unmounting an `egui::Context` outside `eframe`'s `destroy()` lifecycle.
     pub fn teardown(ctx: &egui::Context) {
         #[cfg(target_arch = "wasm32")]
         if let Some(plugin) = ctx.plugin_opt::<Self>() {
@@ -138,6 +115,7 @@ impl egui::Plugin for WebAccessKitPlugin {
             wakeup,
         ) {
             dom::insert_bridge(self.bridge_id, bridge);
+            dom::install_viewport_listeners(self.bridge_id);
         }
     }
 
@@ -149,11 +127,7 @@ impl egui::Plugin for WebAccessKitPlugin {
                 .events
                 .retain(|event| !matches!(event, egui::Event::WindowFocused(false)));
         }
-        if let Ok(mut pending) = self.queue.lock()
-            && !pending.is_empty()
-        {
-            input.events.extend(pending.drain(..));
-        }
+        dom::drain_pending_events(self.bridge_id, &self.queue, &mut input.events);
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -171,7 +145,7 @@ impl egui::Plugin for WebAccessKitPlugin {
         });
     }
 
-    #[cfg(all(target_arch = "wasm32", feature = "egui-037"))]
+    #[cfg(target_arch = "wasm32")]
     fn on_exit(&mut self, _ctx: &egui::Context) {
         dom::remove_bridge(self.bridge_id);
     }

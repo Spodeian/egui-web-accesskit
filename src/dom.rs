@@ -6,18 +6,27 @@ use std::sync::{Arc, Mutex};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 use web_sys::{
-    Document, Element, Event, FocusOptions, HtmlCanvasElement, HtmlElement, HtmlInputElement,
-    KeyboardEvent, ShadowRoot, Window,
+    AddEventListenerOptions, Document, Element, Event, FocusOptions, HtmlCanvasElement,
+    HtmlElement, HtmlInputElement, HtmlTextAreaElement, KeyboardEvent, ShadowRoot, Window,
 };
 
-use crate::egui;
-use crate::egui::accesskit::{NodeId, Rect, Toggled};
+use egui::accesskit::{Action, ActionRequest, Live, NodeId, Rect, Toggled};
 use crate::mapper::{
     DomNodeSpec, DomOp, DomTag, TreeBridge, click_action, decrement_action, focus_action,
-    increment_action, set_numeric_value_action, set_value_action,
+    increment_action, scroll_action, scroll_into_view_action, set_numeric_value_action,
+    set_value_action,
 };
 
-pub(crate) type ActionQueue = Arc<Mutex<Vec<egui::Event>>>;
+pub(crate) enum PendingDomEvent {
+    Action(ActionRequest),
+    TextSelection {
+        target_node: NodeId,
+        anchor_utf16: usize,
+        focus_utf16: usize,
+    },
+}
+
+pub(crate) type ActionQueue = Arc<Mutex<Vec<PendingDomEvent>>>;
 
 thread_local! {
     static BRIDGES: RefCell<HashMap<u64, WebDomBridge>> = RefCell::new(HashMap::new());
@@ -38,6 +47,43 @@ pub(crate) fn insert_bridge(id: u64, bridge: WebDomBridge) {
 
 pub(crate) fn with_bridge_mut<R>(id: u64, f: impl FnOnce(&mut WebDomBridge) -> R) -> Option<R> {
     BRIDGES.with(|bridges| bridges.borrow_mut().get_mut(&id).map(f))
+}
+
+pub(crate) fn install_viewport_listeners(id: u64) {
+    with_bridge_mut(id, |bridge| bridge.install_viewport_listeners(id));
+}
+
+pub(crate) fn drain_pending_events(id: u64, queue: &ActionQueue, out: &mut Vec<egui::Event>) {
+    let drained = {
+        let Ok(mut pending) = queue.lock() else {
+            return;
+        };
+        if pending.is_empty() {
+            return;
+        }
+        pending.drain(..).collect::<Vec<_>>()
+    };
+
+    for event in drained {
+        match event {
+            PendingDomEvent::Action(req) => out.push(egui::Event::AccessKitActionRequest(req)),
+            PendingDomEvent::TextSelection {
+                target_node,
+                anchor_utf16,
+                focus_utf16,
+            } => {
+                if let Some(req) = with_bridge_mut(id, |bridge| {
+                    bridge
+                        .tree
+                        .set_text_selection_action(target_node, anchor_utf16, focus_utf16)
+                })
+                .flatten()
+                {
+                    out.push(egui::Event::AccessKitActionRequest(req));
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn has_dom_focus(id: u64) -> bool {
@@ -62,14 +108,16 @@ pub(crate) fn remove_bridge(id: u64) {
 struct AttachedListener {
     target: web_sys::EventTarget,
     event_type: &'static str,
+    capture: bool,
     closure: Closure<dyn FnMut(Event)>,
 }
 
 impl Drop for AttachedListener {
     fn drop(&mut self) {
-        let _ = self.target.remove_event_listener_with_callback(
+        let _ = self.target.remove_event_listener_with_callback_and_bool(
             self.event_type,
             self.closure.as_ref().unchecked_ref(),
+            self.capture,
         );
     }
 }
@@ -95,6 +143,7 @@ impl InteractionKind {
                 },
                 _ => Self::Text,
             },
+            DomTag::TextArea => Self::Text,
             DomTag::Button | DomTag::Anchor => Self::Click,
             _ if spec.clickable => Self::Click,
             _ => Self::None,
@@ -111,9 +160,11 @@ pub(crate) struct WebDomBridge {
     elements: HashMap<NodeId, Element>,
     specs: HashMap<NodeId, DomNodeSpec>,
     listeners: HashMap<NodeId, Vec<AttachedListener>>,
+    viewport_listeners: Vec<AttachedListener>,
     queue: ActionQueue,
     repaint_wakeup: Rc<RefCell<Option<Box<dyn Fn()>>>>,
     syncing_focus: Rc<Cell<bool>>,
+    syncing_selection: Rc<Cell<bool>>,
     last_canvas_rect: Option<(f64, f64, f64, f64)>,
     last_dpr: Option<f64>,
 }
@@ -172,14 +223,64 @@ impl WebDomBridge {
             elements: HashMap::new(),
             specs: HashMap::new(),
             listeners: HashMap::new(),
+            viewport_listeners: Vec::new(),
             queue,
             repaint_wakeup: Rc::new(RefCell::new(Some(wakeup))),
             syncing_focus: Rc::new(Cell::new(false)),
+            syncing_selection: Rc::new(Cell::new(false)),
             last_canvas_rect: None,
             last_dpr: None,
         };
         let _ = bridge.sync_viewport();
         Some(bridge)
+    }
+
+    fn install_viewport_listeners(&mut self, id: u64) {
+        self.viewport_listeners.clear();
+        let window_target: web_sys::EventTarget = self.window.clone().into();
+        if let Some(l) = add_listener_with_options(&window_target, "scroll", true, true, move |_| {
+            with_bridge_mut(id, Self::realign_viewport);
+        }) {
+            self.viewport_listeners.push(l);
+        }
+        if let Some(l) =
+            add_listener_with_options(&window_target, "resize", false, true, move |_| {
+                with_bridge_mut(id, Self::realign_viewport);
+            })
+        {
+            self.viewport_listeners.push(l);
+        }
+
+        let container_target: web_sys::EventTarget = self.container.clone().into();
+        let queue = Arc::clone(&self.queue);
+        let wakeup = Rc::clone(&self.repaint_wakeup);
+        if let Some(l) = add_listener(&container_target, "keydown", move |event| {
+            let Some(kb) = event.dyn_ref::<KeyboardEvent>() else {
+                return;
+            };
+            let action = match kb.key().as_str() {
+                "PageDown" => Action::ScrollDown,
+                "PageUp" => Action::ScrollUp,
+                _ => return,
+            };
+            let Some(target) = event.target().and_then(|t| t.dyn_into::<Element>().ok()) else {
+                return;
+            };
+            if target.tag_name().eq_ignore_ascii_case("TEXTAREA") {
+                return;
+            }
+            let Some(raw_id) = target.get_attribute("data-accesskit-id") else {
+                return;
+            };
+            let Ok(node_id) = raw_id.parse::<u64>().map(NodeId) else {
+                return;
+            };
+            event.prevent_default();
+            event.stop_propagation();
+            push_action(&queue, &wakeup, scroll_action(node_id, action));
+        }) {
+            self.viewport_listeners.push(l);
+        }
     }
 
     pub(crate) fn has_dom_focus(&self) -> bool {
@@ -201,20 +302,32 @@ impl WebDomBridge {
         }
 
         if viewport_changed {
-            for (id, element) in &self.elements {
-                if let Some(spec) = self.specs.get(id) {
-                    apply_bounds(element, spec.bounds, dpr, canvas_origin);
-                }
-            }
+            self.reapply_all_bounds(dpr, canvas_origin);
+        }
+    }
+
+    pub(crate) fn realign_viewport(&mut self) {
+        let (dpr, canvas_origin, viewport_changed) = self.sync_viewport();
+        if viewport_changed {
+            self.reapply_all_bounds(dpr, canvas_origin);
         }
     }
 
     pub(crate) fn destroy(&mut self) {
         *self.repaint_wakeup.borrow_mut() = None;
+        self.viewport_listeners.clear();
         self.listeners.clear();
         self.elements.clear();
         self.specs.clear();
         self.container.remove();
+    }
+
+    fn reapply_all_bounds(&self, dpr: f64, canvas_origin: (f64, f64)) {
+        for (id, element) in &self.elements {
+            if let Some(spec) = self.specs.get(id) {
+                apply_bounds(element, spec.bounds, dpr, canvas_origin);
+            }
+        }
     }
 
     fn sync_viewport(&mut self) -> (f64, (f64, f64), bool) {
@@ -254,16 +367,18 @@ impl WebDomBridge {
     fn upsert_node(&mut self, spec: DomNodeSpec, dpr: f64, canvas_origin: (f64, f64)) {
         let id = spec.id;
         let old_spec = self.specs.get(&id);
-        let tag_changed = old_spec.is_some_and(|old| old.tag != spec.tag);
+        let desired_tag = element_tag_name(&spec);
+        let tag_changed = old_spec.is_some_and(|old| element_tag_name(old) != desired_tag);
         let needs_rebind = old_spec.is_none_or(|old| {
-            old.tag != spec.tag
+            element_tag_name(old) != desired_tag
                 || InteractionKind::from_spec(old) != InteractionKind::from_spec(&spec)
                 || old.focusable != spec.focusable
                 || old.disabled != spec.disabled
+                || old.read_only != spec.read_only
         });
 
         let element = if tag_changed || !self.elements.contains_key(&id) {
-            let Ok(new_el) = self.document.create_element(spec.tag.as_str()) else {
+            let Ok(new_el) = self.document.create_element(desired_tag) else {
                 return;
             };
             let _ = new_el.set_attribute("data-accesskit-id", &id.0.to_string());
@@ -281,6 +396,14 @@ impl WebDomBridge {
         };
 
         apply_dom_attributes(&element, &spec, dpr, canvas_origin);
+
+        if supports_dom_selection(&spec)
+            && let Some((anchor, focus)) = spec.text_selection
+            && active_element_for(self.container.as_ref(), &self.document)
+                .is_some_and(|active| active == element)
+        {
+            write_dom_selection(&element, anchor, focus, &self.syncing_selection);
+        }
 
         if Some(id) == self.tree.root_id() && element.parent_node().is_none() {
             let _ = self.container.append_child(&element);
@@ -312,18 +435,21 @@ impl WebDomBridge {
                         event.prevent_default();
                     }
                     event.stop_propagation();
-                    push_event(&queue, &wakeup, click_action(id));
+                    push_action(&queue, &wakeup, click_action(id));
                 }) {
                     out.push(l);
                 }
             }
             InteractionKind::Text => {
-                if let Some(input_el) = element.dyn_ref::<HtmlInputElement>().cloned() {
+                if !spec.read_only {
+                    let el_for_input = element.clone();
                     let queue = Arc::clone(&self.queue);
                     let wakeup = Rc::clone(&self.repaint_wakeup);
                     if let Some(l) = add_listener(&target, "input", move |event| {
                         event.stop_propagation();
-                        push_event(&queue, &wakeup, set_value_action(id, input_el.value()));
+                        if let Some(val) = read_text_value(&el_for_input) {
+                            push_action(&queue, &wakeup, set_value_action(id, val));
+                        }
                     }) {
                         out.push(l);
                     }
@@ -338,6 +464,34 @@ impl WebDomBridge {
                 }) {
                     out.push(l);
                 }
+                if supports_dom_selection(spec) {
+                    let el_for_select = element.clone();
+                    let queue = Arc::clone(&self.queue);
+                    let wakeup = Rc::clone(&self.repaint_wakeup);
+                    let syncing = Rc::clone(&self.syncing_selection);
+                    if let Some(l) = add_listener(&target, "select", move |_event| {
+                        emit_dom_selection(&el_for_select, id, &syncing, &queue, &wakeup);
+                    }) {
+                        out.push(l);
+                    }
+
+                    let el_for_keyup = element.clone();
+                    let queue = Arc::clone(&self.queue);
+                    let wakeup = Rc::clone(&self.repaint_wakeup);
+                    let syncing = Rc::clone(&self.syncing_selection);
+                    if let Some(l) = add_listener(&target, "keyup", move |event| {
+                        if let Some(kb) = event.dyn_ref::<KeyboardEvent>()
+                            && matches!(
+                                kb.key().as_str(),
+                                "ArrowLeft" | "ArrowRight" | "ArrowUp" | "ArrowDown" | "Home" | "End"
+                            )
+                        {
+                            emit_dom_selection(&el_for_keyup, id, &syncing, &queue, &wakeup);
+                        }
+                    }) {
+                        out.push(l);
+                    }
+                }
             }
             InteractionKind::Numeric { unstepped } => {
                 if let Some(input_el) = element.dyn_ref::<HtmlInputElement>().cloned() {
@@ -346,7 +500,7 @@ impl WebDomBridge {
                     if let Some(l) = add_listener(&target, "input", move |event| {
                         event.stop_propagation();
                         if let Ok(val) = input_el.value().parse::<f64>() {
-                            push_event(&queue, &wakeup, set_numeric_value_action(id, val));
+                            push_action(&queue, &wakeup, set_numeric_value_action(id, val));
                         }
                     }) {
                         out.push(l);
@@ -362,13 +516,13 @@ impl WebDomBridge {
                                 "ArrowRight" | "ArrowUp" => {
                                     event.prevent_default();
                                     event.stop_propagation();
-                                    push_event(&queue, &wakeup, increment_action(id));
+                                    push_action(&queue, &wakeup, increment_action(id));
                                     return;
                                 }
                                 "ArrowLeft" | "ArrowDown" => {
                                     event.prevent_default();
                                     event.stop_propagation();
-                                    push_event(&queue, &wakeup, decrement_action(id));
+                                    push_action(&queue, &wakeup, decrement_action(id));
                                     return;
                                 }
                                 _ => {}
@@ -391,7 +545,14 @@ impl WebDomBridge {
             let syncing_focus = Rc::clone(&self.syncing_focus);
             if let Some(l) = add_listener(&target, "focus", move |_event| {
                 if !syncing_focus.get() {
-                    push_event(&queue, &wakeup, focus_action(id));
+                    push_events(
+                        &queue,
+                        &wakeup,
+                        [
+                            PendingDomEvent::Action(focus_action(id)),
+                            PendingDomEvent::Action(scroll_into_view_action(id)),
+                        ],
+                    );
                 }
             }) {
                 out.push(l);
@@ -408,7 +569,11 @@ impl WebDomBridge {
         if Some(parent) == self.tree.root_id() && parent_el.parent_node().is_none() {
             let _ = self.container.append_child(parent_el);
         }
-        if self.specs.get(&parent).is_some_and(|s| s.tag == DomTag::Input) {
+        if self
+            .specs
+            .get(&parent)
+            .is_some_and(|s| matches!(s.tag, DomTag::Input | DomTag::TextArea))
+        {
             return;
         }
 
@@ -481,6 +646,124 @@ fn active_element_for(node: &web_sys::Node, document: &Document) -> Option<Eleme
     }
 }
 
+fn element_tag_name(spec: &DomNodeSpec) -> &'static str {
+    if spec.tag == DomTag::Heading {
+        match spec.heading_level {
+            Some(1) => "h1",
+            Some(2) | None => "h2",
+            Some(3) => "h3",
+            Some(4) => "h4",
+            Some(5) => "h5",
+            Some(6) => "h6",
+            Some(_) => "div",
+        }
+    } else {
+        spec.tag.as_str()
+    }
+}
+
+fn supports_dom_selection(spec: &DomNodeSpec) -> bool {
+    matches!(spec.tag, DomTag::TextArea)
+        || (spec.tag == DomTag::Input
+            && matches!(
+                spec.input_type,
+                None | Some("text" | "search" | "url" | "password")
+            ))
+}
+
+fn read_text_value(element: &Element) -> Option<String> {
+    if let Some(input) = element.dyn_ref::<HtmlInputElement>() {
+        Some(input.value())
+    } else {
+        element.dyn_ref::<HtmlTextAreaElement>().map(|ta| ta.value())
+    }
+}
+
+fn selection_fields(element: &Element) -> Option<(Option<u32>, Option<u32>, Option<String>)> {
+    if let Some(input) = element.dyn_ref::<HtmlInputElement>() {
+        Some((
+            input.selection_start().ok()?,
+            input.selection_end().ok()?,
+            input.selection_direction().ok()?,
+        ))
+    } else if let Some(ta) = element.dyn_ref::<HtmlTextAreaElement>() {
+        Some((
+            ta.selection_start().ok()?,
+            ta.selection_end().ok()?,
+            ta.selection_direction().ok()?,
+        ))
+    } else {
+        None
+    }
+}
+
+fn read_dom_selection(element: &Element) -> Option<(usize, usize)> {
+    let (Some(start), Some(end), dir) = selection_fields(element)? else {
+        return None;
+    };
+    if dir.as_deref() == Some("backward") {
+        Some((end as usize, start as usize))
+    } else {
+        Some((start as usize, end as usize))
+    }
+}
+
+fn write_dom_selection(
+    element: &Element,
+    anchor: usize,
+    focus: usize,
+    syncing_selection: &Cell<bool>,
+) {
+    let (Ok(anchor_u32), Ok(focus_u32)) = (u32::try_from(anchor), u32::try_from(focus)) else {
+        return;
+    };
+    let backward = anchor_u32 > focus_u32;
+    let (start, end, dir) = if backward {
+        (focus_u32, anchor_u32, "backward")
+    } else {
+        (anchor_u32, focus_u32, "forward")
+    };
+
+    if let Some((Some(cur_start), Some(cur_end), cur_dir)) = selection_fields(element)
+        && cur_start == start
+        && cur_end == end
+        && cur_dir.as_deref().is_some_and(|d| (d == "backward") == backward)
+    {
+        return;
+    }
+
+    syncing_selection.set(true);
+    if let Some(input) = element.dyn_ref::<HtmlInputElement>() {
+        let _ = input.set_selection_range_with_direction(start, end, dir);
+    } else if let Some(ta) = element.dyn_ref::<HtmlTextAreaElement>() {
+        let _ = ta.set_selection_range_with_direction(start, end, dir);
+    }
+    syncing_selection.set(false);
+}
+
+fn emit_dom_selection(
+    element: &Element,
+    id: NodeId,
+    syncing_selection: &Cell<bool>,
+    queue: &ActionQueue,
+    wakeup: &Rc<RefCell<Option<Box<dyn Fn()>>>>,
+) {
+    if syncing_selection.get() {
+        return;
+    }
+    if let Some((anchor_utf16, focus_utf16)) = read_dom_selection(element) {
+        push_events(
+            queue,
+            wakeup,
+            [PendingDomEvent::TextSelection {
+                target_node: id,
+                anchor_utf16,
+                focus_utf16,
+            }],
+        );
+    }
+}
+
 fn apply_dom_attributes(
     element: &Element,
     spec: &DomNodeSpec,
@@ -489,6 +772,22 @@ fn apply_dom_attributes(
 ) {
     set_optional_attr(element, "role", spec.aria_role);
     set_optional_attr(element, "aria-label", spec.label.as_deref());
+    set_optional_attr(element, "placeholder", spec.placeholder.as_deref());
+
+    let heading_level = spec.heading_level.map(|n| n.to_string());
+    set_optional_attr(element, "aria-level", heading_level.as_deref());
+    set_optional_attr(element, "aria-modal", spec.modal.then_some("true"));
+    let live = match spec.live {
+        Some(Live::Polite) => Some("polite"),
+        Some(Live::Assertive) => Some("assertive"),
+        _ => None,
+    };
+    set_optional_attr(element, "aria-live", live);
+    set_optional_attr(
+        element,
+        "aria-multiline",
+        (spec.tag == DomTag::TextArea).then_some("true"),
+    );
 
     if let Some(input_type) = spec.input_type {
         let _ = element.set_attribute("type", input_type);
@@ -510,6 +809,14 @@ fn apply_dom_attributes(
     } else {
         let _ = element.remove_attribute("disabled");
         let _ = element.remove_attribute("aria-disabled");
+    }
+
+    if spec.read_only {
+        let _ = element.set_attribute("readonly", "");
+        let _ = element.set_attribute("aria-readonly", "true");
+    } else {
+        let _ = element.remove_attribute("readonly");
+        let _ = element.remove_attribute("aria-readonly");
     }
 
     match spec.expanded {
@@ -582,6 +889,7 @@ fn apply_dom_attributes(
 
     if let Some(input_el) = element.dyn_ref::<HtmlInputElement>() {
         input_el.set_disabled(spec.disabled);
+        input_el.set_read_only(spec.read_only);
         match spec.toggled {
             Some(Toggled::True) => {
                 input_el.set_indeterminate(false);
@@ -629,6 +937,13 @@ fn apply_dom_attributes(
                 input_el.set_value(val);
             }
         }
+    } else if let Some(textarea_el) = element.dyn_ref::<HtmlTextAreaElement>() {
+        textarea_el.set_disabled(spec.disabled);
+        textarea_el.set_read_only(spec.read_only);
+        let val = spec.value.as_deref().unwrap_or("");
+        if textarea_el.value() != val {
+            textarea_el.set_value(val);
+        }
     } else if matches!(
         spec.tag,
         DomTag::Span | DomTag::Heading | DomTag::Anchor | DomTag::ListItem
@@ -671,7 +986,10 @@ fn apply_bounds(element: &Element, bounds: Option<Rect>, dpr: f64, canvas_origin
 }
 
 fn natively_focusable(tag: DomTag) -> bool {
-    matches!(tag, DomTag::Button | DomTag::Input | DomTag::Anchor)
+    matches!(
+        tag,
+        DomTag::Button | DomTag::Input | DomTag::TextArea | DomTag::Anchor
+    )
 }
 
 fn set_optional_attr(element: &Element, name: &str, value: Option<&str>) {
@@ -697,17 +1015,52 @@ fn add_listener(
     Some(AttachedListener {
         target: target.clone(),
         event_type,
+        capture: false,
         closure,
     })
 }
 
-fn push_event(
+fn add_listener_with_options(
+    target: &web_sys::EventTarget,
+    event_type: &'static str,
+    capture: bool,
+    passive: bool,
+    handler: impl FnMut(Event) + 'static,
+) -> Option<AttachedListener> {
+    let options = AddEventListenerOptions::new();
+    options.set_capture(capture);
+    options.set_passive(passive);
+    let closure = Closure::wrap(Box::new(handler) as Box<dyn FnMut(Event)>);
+    target
+        .add_event_listener_with_callback_and_add_event_listener_options(
+            event_type,
+            closure.as_ref().unchecked_ref(),
+            &options,
+        )
+        .ok()?;
+    Some(AttachedListener {
+        target: target.clone(),
+        event_type,
+        capture,
+        closure,
+    })
+}
+
+fn push_action(
     queue: &ActionQueue,
     wakeup: &Rc<RefCell<Option<Box<dyn Fn()>>>>,
-    request: egui::accesskit::ActionRequest,
+    request: ActionRequest,
+) {
+    push_events(queue, wakeup, [PendingDomEvent::Action(request)]);
+}
+
+fn push_events(
+    queue: &ActionQueue,
+    wakeup: &Rc<RefCell<Option<Box<dyn Fn()>>>>,
+    events: impl IntoIterator<Item = PendingDomEvent>,
 ) {
     if let Ok(mut guard) = queue.lock() {
-        guard.push(egui::Event::AccessKitActionRequest(request));
+        guard.extend(events);
     }
     if let Some(cb) = wakeup.borrow().as_ref() {
         cb();

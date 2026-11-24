@@ -1,6 +1,6 @@
 [package]
 name = "egui-web-accesskit"
-version = "0.1.0"
+version = "0.37.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Drop-in egui Plugin that mirrors AccessKit trees to the browser DOM on wasm32"
@@ -8,20 +8,14 @@ readme = "README.md"
 keywords = ["egui", "accesskit", "accessibility", "wasm", "web"]
 categories = ["accessibility", "gui", "wasm"]
 
-[features]
-default = ["egui-037"]
-egui-036 = ["dep:egui_036", "dep:accesskit_consumer_038"]
-egui-037 = ["dep:egui_037", "dep:accesskit_consumer_039"]
-
 [dependencies]
-accesskit_consumer_038 = { package = "accesskit_consumer", version = "0.38", optional = true }
-accesskit_consumer_039 = { package = "accesskit_consumer", version = "0.39", optional = true }
-egui_036 = { package = "egui", version = "0.36", default-features = false, optional = true }
-egui_037 = { package = "egui", version = "0.37", default-features = false, optional = true }
+accesskit_consumer = "0.39"
+egui = { version = "0.37", default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
 web-sys = { version = "0.3", features = [
+    "AddEventListenerOptions",
     "CssStyleDeclaration",
     "Document",
     "DomRect",
@@ -32,6 +26,7 @@ web-sys = { version = "0.3", features = [
     "HtmlCanvasElement",
     "HtmlElement",
     "HtmlInputElement",
+    "HtmlTextAreaElement",
     "KeyboardEvent",
     "Node",
     "ShadowRoot",
