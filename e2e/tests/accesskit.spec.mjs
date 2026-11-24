@@ -1,7 +1,8 @@
+import AxeBuilder from "@axe-core/playwright";
 import { expect, test } from "@playwright/test";
 
 test.describe("egui-web-accesskit E2E", () => {
-  test("mirrors widgets, routes DOM/keyboard interactions, preserves focus, and tracks zoom", async ({
+  test("mirrors widgets, passes axe-core ARIA checks, routes DOM/keyboard/password/scroll interactions, preserves focus, and tracks zoom", async ({
     page,
   }) => {
     const errors = [];
@@ -12,7 +13,7 @@ test.describe("egui-web-accesskit E2E", () => {
     const overlay = page.locator('[data-egui-accesskit="true"]');
     await expect(overlay).toBeAttached({ timeout: 15000 });
 
-    // 1. Initial accessibility mirror
+    // 1. Initial accessibility mirror & ARIA metadata
     const heading = overlay.getByRole("heading", {
       name: "egui-web-accesskit demo",
       level: 1,
@@ -26,19 +27,32 @@ test.describe("egui-web-accesskit E2E", () => {
     });
     const opacitySlider = overlay.getByRole("slider", { name: "Opacity" });
     const volumeSlider = overlay.getByRole("slider", { name: "Volume" });
+    const docsLink = overlay.getByRole("link", { name: "egui docs" });
     const noteBox = overlay.getByRole("textbox", { name: "Note:" });
     const detailsBtn = overlay.getByRole("button", { name: "Advanced details" });
 
     await expect(heading).toHaveAttribute("aria-level", "1");
     await expect(incBtn).toBeAttached();
+    await expect(incBtn).toHaveAttribute(
+      "aria-description",
+      "Adds one to the click counter"
+    );
     await expect(notifyCheckbox).toHaveAttribute("aria-checked", "false");
     await expect(triCheckbox).toHaveAttribute("aria-checked", "mixed");
     await expect(opacitySlider).toHaveAttribute("step", "any");
     await expect(opacitySlider).toHaveValue("0.35");
     await expect(volumeSlider).toHaveAttribute("step", "5");
     await expect(volumeSlider).toHaveValue("50");
+    await expect(volumeSlider).toHaveAttribute("aria-valuetext", "50%");
+    await expect(docsLink).toHaveAttribute("href", "https://docs.rs/egui");
     await expect(noteBox).toHaveValue("Type here");
     await expect(detailsBtn).toHaveAttribute("aria-expanded", "false");
+
+    const axeResults = await new AxeBuilder({ page })
+      .include('[data-egui-accesskit="true"]')
+      .disableRules(["color-contrast"])
+      .analyze();
+    expect(axeResults.violations).toEqual([]);
 
     // 2. Idle wakeup & click round-trip
     await incBtn.evaluate((el) => el.click());
@@ -103,6 +117,29 @@ test.describe("egui-web-accesskit E2E", () => {
     await expect(tokenBox).toHaveAttribute("aria-readonly", "true");
     await expect(tokenBox).toHaveValue("RO-123");
 
+    // 7. Password masking safety & ReplaceSelectedText / SetValue editing
+    const pwBox = overlay.getByLabel("Password:");
+    await expect(pwBox).toHaveAttribute("type", "password");
+    await expect(overlay.getByText("Secret length: 6")).toBeAttached();
+    const overlayHtml = await overlay.innerHTML();
+    expect(overlayHtml).not.toContain("s3cr3t");
+    const pwInitialValue = await pwBox.inputValue();
+    expect(pwInitialValue).not.toContain("s3cr3t");
+    expect(pwInitialValue.length).toBe(6);
+
+    await pwBox.focus();
+    await page.keyboard.press("End");
+    await page.keyboard.type("!");
+    await expect(overlay.getByText("Secret length: 7")).toBeAttached();
+
+    await pwBox.evaluate((el) => {
+      el.focus();
+      el.setSelectionRange(0, el.value.length);
+    });
+    await page.keyboard.type("newpass12");
+    await expect(overlay.getByText("Secret length: 9")).toBeAttached();
+
+    // 8. ScrollArea ScrollIntoView on DOM focus
     const bottomBtn = overlay.getByRole("button", { name: "Bottom action" });
     const bottomBefore = await bottomBtn.boundingBox();
     expect(bottomBefore).not.toBeNull();
@@ -114,7 +151,7 @@ test.describe("egui-web-accesskit E2E", () => {
       })
       .toBeLessThan(bottomBefore.y - 20);
 
-    // 7. Idle outer-page scroll/offset realigns overlay without waking egui
+    // 9. Idle outer-page scroll/offset realigns overlay without waking egui
     const incBeforeScroll = await incBtn.boundingBox();
     expect(incBeforeScroll).not.toBeNull();
     await page.evaluate(() => {
@@ -140,7 +177,7 @@ test.describe("egui-web-accesskit E2E", () => {
       })
       .toBeLessThan(2);
 
-    // 8. Zoomed coordinate alignment with real mouse click on <canvas>
+    // 10. Zoomed coordinate alignment with real mouse click on <canvas>
     const boxBefore = await incBtn.boundingBox();
     expect(boxBefore).not.toBeNull();
 
@@ -162,6 +199,55 @@ test.describe("egui-web-accesskit E2E", () => {
       boxAfter.y + boxAfter.height / 2
     );
     await expect(overlay.getByText("Button clicked 2 times")).toBeAttached();
+
+    expect(errors).toEqual([]);
+  });
+
+  test("supports Shadow DOM via WebAccessKitPlugin::from_canvas", async ({
+    page,
+  }) => {
+    const errors = [];
+    page.on("pageerror", (err) => errors.push(err.message));
+
+    await page.goto("/?shadow=1");
+
+    const shadowOverlay = page.locator('#shadow-host [data-egui-accesskit="true"]');
+    await expect(shadowOverlay).toBeAttached({ timeout: 15000 });
+
+    const domPlacement = await page.evaluate(() => {
+      const host = document.getElementById("shadow-host");
+      const root = host?.shadowRoot;
+      return {
+        lightDomOverlay: document.querySelector('[data-egui-accesskit="true"]') !== null,
+        shadowHasCanvas: root?.querySelector("#the_canvas_id") !== null,
+        shadowHasOverlay: root?.querySelector('[data-egui-accesskit="true"]') !== null,
+      };
+    });
+    expect(domPlacement).toEqual({
+      lightDomOverlay: false,
+      shadowHasCanvas: true,
+      shadowHasOverlay: true,
+    });
+
+    await shadowOverlay
+      .getByRole("button", { name: "Increment counter" })
+      .evaluate((el) => el.click());
+    await expect(
+      shadowOverlay.getByText("Button clicked 1 times")
+    ).toBeAttached();
+
+    const noteBox = shadowOverlay.getByRole("textbox", { name: "Note:" });
+    await noteBox.evaluate((el) => {
+      el.focus();
+      el.setSelectionRange(0, el.value.length);
+    });
+    await page.keyboard.type("!shadow");
+    await expect(shadowOverlay.getByText("Warning banner")).toBeAttached();
+    const activeInShadow = await noteBox.evaluate((el) => {
+      const host = document.getElementById("shadow-host");
+      return host?.shadowRoot?.activeElement === el;
+    });
+    expect(activeInShadow).toBe(true);
 
     expect(errors).toEqual([]);
   });
