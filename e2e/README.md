@@ -35,9 +35,9 @@ npx playwright test --headed
 
 [tests/accesskit.spec.mjs](tests/accesskit.spec.mjs) verifies:
 
-- Semantic DOM mirroring, `aria-level`, `aria-description`, `aria-valuetext`, link `href`, `aria-checked="mixed"`, `aria-expanded`, stepped/unstepped `<input type="range">`, and zero `@axe-core/playwright` violations inside `[data-egui-accesskit="true"]`.
-- Idle repaint wakeup from DOM clicks, disclosure toggles, and keyboard slider steps.
+- Semantic DOM mirroring, `aria-level`, `aria-description`, `aria-valuetext`, `aria-pressed`, radio groups (`aria-checked`), disabled controls, spinbuttons, progress bars, `aria-live="polite"`, link `href`, `aria-checked="mixed"`, `aria-expanded` / `aria-controls`, stepped/unstepped `<input type="range">`, and zero `@axe-core/playwright` violations inside `[data-egui-accesskit="true"]` (including while `ComboBox` and modal `AlertDialog` popups are open).
+- Idle repaint wakeup from DOM clicks, toggle buttons, disclosure toggles, `ComboBox` option selection (`Enter`), modal `AlertDialog`, and keyboard slider steps.
 - DOM focus preservation across sibling insertion, multiline `<textarea>` editing (`placeholder`, `aria-multiline`, newlines), and UTF-16 selection sync.
 - Password masking safety (no plaintext in the DOM) and `ReplaceSelectedText` / `SetValue` edits.
-- `ScrollArea` `ScrollIntoView` on DOM focus, idle outer-page scroll/offset realignment, and `devicePixelRatio` zoom alignment against real `<canvas>` pointer clicks.
+- `ScrollArea` `PageDown` / `PageUp` scroll actions and `ScrollIntoView` on DOM focus, idle outer-page scroll/offset realignment, and `devicePixelRatio` zoom alignment against real `<canvas>` pointer clicks.
 - Shadow DOM hosting via `WebAccessKitPlugin::from_canvas` (`/?shadow=1`), including `shadowRoot.activeElement` focus retention.

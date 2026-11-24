@@ -1,6 +1,6 @@
 # egui-web-accesskit Demo App
 
-Standalone `eframe` application exercising the widgets, ARIA metadata, focus/scroll sync, password masking, and Shadow DOM support mirrored by `egui-web-accesskit` (tracks `main` / `egui 0.37`).
+Standalone two-column `eframe` showcase exercising the widgets, ARIA metadata, focus/scroll sync, popups (`ComboBox`), modal `AlertDialog`, polite `aria-live` status announcements, password masking, and Shadow DOM support mirrored by `egui-web-accesskit` (available and verified across all three version branches: `main` / `0.37`, `egui-0.36` / `0.36`, and `egui-0.35` / `0.35`).
 
 ## Prerequisites
 

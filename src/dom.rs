@@ -186,6 +186,7 @@ impl InteractionKind {
 }
 
 pub(crate) struct WebDomBridge {
+    bridge_id: u64,
     window: Window,
     document: Document,
     canvas: Option<Element>,
@@ -193,6 +194,8 @@ pub(crate) struct WebDomBridge {
     tree: TreeBridge,
     elements: HashMap<NodeId, Element>,
     specs: HashMap<NodeId, DomNodeSpec>,
+    hoisted_children: HashMap<NodeId, Vec<NodeId>>,
+    text_editable: HashMap<NodeId, bool>,
     listeners: HashMap<NodeId, Vec<AttachedListener>>,
     viewport_listeners: Vec<AttachedListener>,
     queue: ActionQueue,
@@ -258,6 +261,7 @@ impl WebDomBridge {
         }
 
         let mut bridge = Self {
+            bridge_id: id,
             window,
             document,
             canvas,
@@ -265,6 +269,8 @@ impl WebDomBridge {
             tree: TreeBridge::new(),
             elements: HashMap::new(),
             specs: HashMap::new(),
+            hoisted_children: HashMap::new(),
+            text_editable: HashMap::new(),
             listeners: HashMap::new(),
             viewport_listeners: Vec::new(),
             queue,
@@ -333,15 +339,47 @@ impl WebDomBridge {
     }
 
     pub(crate) fn apply_update(&mut self, update: egui::accesskit::TreeUpdate) {
+        let prev_focused_id = active_element_for(self.container.as_ref(), &self.document)
+            .filter(|active| self.container.contains(Some(active.as_ref())))
+            .and_then(|el| el.get_attribute("data-accesskit-id"))
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .map(NodeId);
+
         let (dpr, canvas_origin, viewport_changed) = self.sync_viewport();
         let ops = self.tree.apply_update(update);
+        let mut saw_focus_op = false;
 
         for op in ops {
             match op {
                 DomOp::Upsert(spec) => self.upsert_node(spec, dpr, canvas_origin),
                 DomOp::SetChildren { parent, children } => self.set_children(parent, &children),
                 DomOp::Remove(id) => self.remove_node(id),
-                DomOp::SetFocus(target) => self.set_focus(target),
+                DomOp::SetFocus(target) => {
+                    saw_focus_op = true;
+                    self.set_focus(target);
+                }
+            }
+        }
+
+        // Reparenting a focused element into a newly created ancestor <div> blurs it in
+        // Blink without changing AccessKit's focused NodeId; restore focus & selection.
+        if !saw_focus_op
+            && let Some(focused_id) = prev_focused_id
+            && self.specs.get(&focused_id).is_some_and(|s| !s.disabled)
+            && let Some(el) = self.elements.get(&focused_id)
+            && active_element_for(self.container.as_ref(), &self.document).as_ref() != Some(el)
+        {
+            let saved_sel = selection_fields(el);
+            self.set_focus(Some(focused_id));
+            if let Some((Some(start), Some(end), dir)) = saved_sel {
+                let direction = dir.as_deref().unwrap_or("none");
+                self.syncing_selection.set(true);
+                if let Some(input) = el.dyn_ref::<HtmlInputElement>() {
+                    let _ = input.set_selection_range_with_direction(start, end, direction);
+                } else if let Some(ta) = el.dyn_ref::<HtmlTextAreaElement>() {
+                    let _ = ta.set_selection_range_with_direction(start, end, direction);
+                }
+                self.syncing_selection.set(false);
             }
         }
 
@@ -362,6 +400,8 @@ impl WebDomBridge {
         self.viewport_listeners.clear();
         self.listeners.clear();
         self.dom_owned_selection.borrow_mut().clear();
+        self.hoisted_children.clear();
+        self.text_editable.clear();
         self.elements.clear();
         self.specs.clear();
         self.container.remove();
@@ -419,20 +459,23 @@ impl WebDomBridge {
         let id = spec.id;
         let old_spec = self.specs.get(&id);
         let desired_tag = element_tag_name(&spec);
+        let can_edit_text = self.tree.supports_text_edit_actions(id);
         let tag_changed = old_spec.is_some_and(|old| element_tag_name(old) != desired_tag);
         let needs_rebind = old_spec.is_none_or(|old| {
             element_tag_name(old) != desired_tag
+                || old.aria_role != spec.aria_role
                 || old.input_type != spec.input_type
                 || InteractionKind::from_spec(old) != InteractionKind::from_spec(&spec)
                 || old.focusable != spec.focusable
                 || old.disabled != spec.disabled
                 || old.read_only != spec.read_only
-        });
+        }) || self.text_editable.get(&id).copied() != Some(can_edit_text);
 
         let element = if tag_changed || !self.elements.contains_key(&id) {
             let Ok(new_el) = self.document.create_element(desired_tag) else {
                 return;
             };
+            let _ = new_el.set_attribute("id", &dom_element_id(self.bridge_id, id));
             let _ = new_el.set_attribute("data-accesskit-id", &id.0.to_string());
             if let Some(old_el) = self.elements.insert(id, new_el.clone()) {
                 if let Some(parent) = old_el.parent_node() {
@@ -448,7 +491,15 @@ impl WebDomBridge {
         };
 
         let skip_text_sync = self.has_pending_text_event(id);
-        apply_dom_attributes(&element, &spec, dpr, canvas_origin, skip_text_sync);
+        apply_dom_attributes(
+            &element,
+            &spec,
+            dpr,
+            canvas_origin,
+            skip_text_sync,
+            self.hoisted_children.get(&id).map(Vec::as_slice),
+            self.bridge_id,
+        );
 
         let dom_owned = if !skip_text_sync {
             self.dom_owned_selection.borrow_mut().remove(&id)
@@ -483,16 +534,22 @@ impl WebDomBridge {
 
         if needs_rebind {
             self.listeners.remove(&id);
-            let attached = self.attach_listeners(&element, &spec);
+            let attached = self.attach_listeners(&element, &spec, can_edit_text);
             if !attached.is_empty() {
                 self.listeners.insert(id, attached);
             }
         }
 
+        self.text_editable.insert(id, can_edit_text);
         self.specs.insert(id, spec);
     }
 
-    fn attach_listeners(&self, element: &Element, spec: &DomNodeSpec) -> Vec<AttachedListener> {
+    fn attach_listeners(
+        &self,
+        element: &Element,
+        spec: &DomNodeSpec,
+        can_edit_text: bool,
+    ) -> Vec<AttachedListener> {
         let mut out = Vec::new();
         let target: web_sys::EventTarget = element.clone().into();
         let id = spec.id;
@@ -511,9 +568,24 @@ impl WebDomBridge {
                 }) {
                     out.push(l);
                 }
+                if !matches!(spec.tag, DomTag::Button | DomTag::Anchor | DomTag::Input) {
+                    let queue = Arc::clone(&self.queue);
+                    let wakeup = Rc::clone(&self.repaint_wakeup);
+                    if let Some(l) = add_listener(&target, "keydown", move |event| {
+                        if let Some(kb) = event.dyn_ref::<KeyboardEvent>()
+                            && matches!(kb.key().as_str(), "Enter" | " ")
+                        {
+                            event.prevent_default();
+                            event.stop_propagation();
+                            push_action(&queue, &wakeup, click_action(id));
+                        }
+                    }) {
+                        out.push(l);
+                    }
+                }
             }
             InteractionKind::Text => {
-                if !spec.read_only {
+                if !spec.read_only && can_edit_text {
                     let el_for_input = element.clone();
                     let queue = Arc::clone(&self.queue);
                     let wakeup = Rc::clone(&self.repaint_wakeup);
@@ -577,6 +649,12 @@ impl WebDomBridge {
                             out.push(l);
                         }
                     }
+                } else if !spec.read_only
+                    && let Some(l) = add_listener(&target, "beforeinput", |event| {
+                        event.prevent_default();
+                    })
+                {
+                    out.push(l);
                 }
                 if let Some(l) = add_listener(&target, "keydown", |event| {
                     if let Some(kb) = event.dyn_ref::<KeyboardEvent>() {
@@ -686,18 +764,53 @@ impl WebDomBridge {
         out
     }
 
-    fn set_children(&self, parent: NodeId, children: &[NodeId]) {
-        let Some(parent_el) = self.elements.get(&parent) else {
+    fn set_children(&mut self, parent: NodeId, children: &[NodeId]) {
+        let Some(parent_el) = self.elements.get(&parent).cloned() else {
             return;
         };
         if Some(parent) == self.tree.root_id() && parent_el.parent_node().is_none() {
-            let _ = self.container.append_child(parent_el);
+            let _ = self.container.append_child(&parent_el);
         }
-        if self
-            .specs
-            .get(&parent)
-            .is_some_and(|s| matches!(s.tag, DomTag::Input | DomTag::TextArea))
+        if let Some(parent_spec) = self.specs.get(&parent).cloned()
+            && is_leaf_tag(parent_spec.tag)
         {
+            // Hoist popups/children attached to leaf elements (<button>, <input>, etc.)
+            // out to the overlay root to avoid invalid nested interactive HTML.
+            let valid_children: Vec<NodeId> = children
+                .iter()
+                .copied()
+                .filter(|child_id| self.elements.contains_key(child_id))
+                .collect();
+            if let Some(prev_hoisted) = self.hoisted_children.get(&parent) {
+                let container_node: &web_sys::Node = self.container.as_ref();
+                for old_id in prev_hoisted {
+                    if !valid_children.contains(old_id)
+                        && let Some(old_el) = self.elements.get(old_id)
+                        && old_el.parent_node().as_ref() == Some(container_node)
+                    {
+                        let _ = self.container.remove_child(old_el);
+                    }
+                }
+            }
+            let container_node: &web_sys::Node = self.container.as_ref();
+            for child_id in &valid_children {
+                if let Some(child_el) = self.elements.get(child_id)
+                    && child_el.parent_node().as_ref() != Some(container_node)
+                {
+                    let _ = self.container.append_child(child_el);
+                }
+            }
+            if valid_children.is_empty() {
+                self.hoisted_children.remove(&parent);
+            } else {
+                self.hoisted_children.insert(parent, valid_children);
+            }
+            sync_disclosure_attrs(
+                &parent_el,
+                &parent_spec,
+                self.hoisted_children.get(&parent).map(Vec::as_slice),
+                self.bridge_id,
+            );
             return;
         }
 
@@ -729,7 +842,45 @@ impl WebDomBridge {
     fn remove_node(&mut self, id: NodeId) {
         self.listeners.remove(&id);
         self.specs.remove(&id);
+        self.text_editable.remove(&id);
         self.dom_owned_selection.borrow_mut().remove(&id);
+        if let Some(old_hoisted) = self.hoisted_children.remove(&id) {
+            let container_node: &web_sys::Node = self.container.as_ref();
+            for child_id in old_hoisted {
+                if let Some(child_el) = self.elements.get(&child_id)
+                    && child_el.parent_node().as_ref() == Some(container_node)
+                {
+                    let _ = self.container.remove_child(child_el);
+                }
+            }
+        }
+        let mut emptied_parents = Vec::new();
+        let mut touched_parents = Vec::new();
+        for (&parent_id, list) in &mut self.hoisted_children {
+            let before = list.len();
+            list.retain(|&child_id| child_id != id);
+            if list.len() != before {
+                touched_parents.push(parent_id);
+                if list.is_empty() {
+                    emptied_parents.push(parent_id);
+                }
+            }
+        }
+        for parent_id in emptied_parents {
+            self.hoisted_children.remove(&parent_id);
+        }
+        for parent_id in touched_parents {
+            if let Some(parent_el) = self.elements.get(&parent_id)
+                && let Some(parent_spec) = self.specs.get(&parent_id)
+            {
+                sync_disclosure_attrs(
+                    parent_el,
+                    parent_spec,
+                    self.hoisted_children.get(&parent_id).map(Vec::as_slice),
+                    self.bridge_id,
+                );
+            }
+        }
         if let Some(el) = self.elements.remove(&id) {
             el.remove();
         }
@@ -964,32 +1115,100 @@ fn password_diff_utf16(old: &str, new: &str) -> (usize, usize, String) {
     (prefix, old_u16.len() - suffix, inserted)
 }
 
-fn apply_dom_attributes(
-    element: &Element,
-    spec: &DomNodeSpec,
-    dpr: f64,
-    canvas_origin: (f64, f64),
-    skip_value_sync: bool,
-) {
+fn dom_element_id(bridge_id: u64, node_id: NodeId) -> String {
+    format!("egui-ak-{bridge_id}-{}", node_id.0)
+}
+
+fn is_leaf_tag(tag: DomTag) -> bool {
+    matches!(
+        tag,
+        DomTag::Button | DomTag::Input | DomTag::TextArea | DomTag::Anchor
+    )
+}
+
+fn effective_role_for(spec: &DomNodeSpec) -> Option<&'static str> {
     let base_role = match spec.aria_role {
         Some("meter" | "scrollbar") if spec.numeric_value.is_none() => None,
         other => other,
     };
-    let effective_role = if base_role.is_none()
+    if base_role.is_none()
         && spec.tag == DomTag::Div
         && (spec.label.is_some() || spec.description.is_some())
     {
         Some("group")
     } else {
         base_role
+    }
+}
+
+fn sync_disclosure_attrs(
+    element: &Element,
+    spec: &DomNodeSpec,
+    hoisted: Option<&[NodeId]>,
+    bridge_id: u64,
+) {
+    let effective_role = effective_role_for(spec);
+    let hoisted = hoisted.filter(|children| !children.is_empty());
+    let expanded = if hoisted.is_some() {
+        Some("true")
+    } else if let Some(exp) = spec.expanded {
+        Some(if exp { "true" } else { "false" })
+    } else if effective_role == Some("combobox") {
+        Some("false")
+    } else {
+        None
     };
+    set_optional_attr(element, "aria-expanded", expanded);
+
+    let controls = hoisted.map(|children| {
+        children
+            .iter()
+            .map(|child_id| dom_element_id(bridge_id, *child_id))
+            .collect::<Vec<_>>()
+            .join(" ")
+    });
+    set_optional_attr(element, "aria-controls", controls.as_deref());
+}
+
+fn apply_dom_attributes(
+    element: &Element,
+    spec: &DomNodeSpec,
+    dpr: f64,
+    canvas_origin: (f64, f64),
+    skip_value_sync: bool,
+    hoisted: Option<&[NodeId]>,
+    bridge_id: u64,
+) {
+    let effective_role = effective_role_for(spec);
     let supports_range_aria = matches!(
         effective_role,
         Some("slider" | "spinbutton" | "progressbar" | "scrollbar" | "meter")
     ) || matches!(spec.input_type, Some("range" | "number"));
 
+    let fallback_label = if spec.label.is_none() {
+        match effective_role {
+            Some("dialog") => Some("Dialog"),
+            Some("alertdialog") => Some("Alert dialog"),
+            Some("progressbar") => Some("Progress"),
+            Some("listbox") => Some("Options"),
+            Some("combobox") => spec
+                .value
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .or(Some("Select")),
+            Some("spinbutton") => Some("Numeric input"),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     set_optional_attr(element, "role", effective_role);
-    set_optional_attr(element, "aria-label", spec.label.as_deref());
+    set_optional_attr(
+        element,
+        "aria-label",
+        spec.label.as_deref().or(fallback_label),
+    );
     set_optional_attr(element, "aria-description", spec.description.as_deref());
     set_optional_attr(element, "placeholder", spec.placeholder.as_deref());
     set_optional_attr(
@@ -1017,6 +1236,8 @@ fn apply_dom_attributes(
 
     if let Some(input_type) = spec.input_type {
         let _ = element.set_attribute("type", input_type);
+    } else if spec.tag == DomTag::Button {
+        let _ = element.set_attribute("type", "button");
     } else {
         let _ = element.remove_attribute("type");
     }
@@ -1030,7 +1251,9 @@ fn apply_dom_attributes(
     }
 
     if spec.disabled {
-        let _ = element.set_attribute("disabled", "");
+        if matches!(spec.tag, DomTag::Button | DomTag::Input | DomTag::TextArea) {
+            let _ = element.set_attribute("disabled", "");
+        }
         let _ = element.set_attribute("aria-disabled", "true");
     } else {
         let _ = element.remove_attribute("disabled");
@@ -1045,50 +1268,37 @@ fn apply_dom_attributes(
         let _ = element.remove_attribute("aria-readonly");
     }
 
-    match spec.expanded {
-        Some(true) => {
-            let _ = element.set_attribute("aria-expanded", "true");
-        }
-        Some(false) => {
-            let _ = element.set_attribute("aria-expanded", "false");
-        }
-        None => {
-            let _ = element.remove_attribute("aria-expanded");
-        }
-    }
+    sync_disclosure_attrs(element, spec, hoisted, bridge_id);
 
-    if spec.tag == DomTag::Button {
+    let toggled_str = spec.toggled.map(|t| match t {
+        Toggled::True => "true",
+        Toggled::False => "false",
+        Toggled::Mixed => "mixed",
+    });
+    if spec.tag == DomTag::Button && matches!(effective_role, None | Some("button")) {
         let _ = element.remove_attribute("aria-checked");
-        match spec.toggled {
-            Some(Toggled::True) => {
-                let _ = element.set_attribute("aria-pressed", "true");
-            }
-            Some(Toggled::False) => {
-                let _ = element.set_attribute("aria-pressed", "false");
-            }
-            Some(Toggled::Mixed) => {
-                let _ = element.set_attribute("aria-pressed", "mixed");
-            }
-            None => {
-                let _ = element.remove_attribute("aria-pressed");
-            }
-        }
+        let _ = element.remove_attribute("aria-selected");
+        set_optional_attr(element, "aria-pressed", toggled_str);
+    } else if matches!(effective_role, Some("option" | "tab")) {
+        let _ = element.remove_attribute("aria-pressed");
+        let _ = element.remove_attribute("aria-checked");
+        let selected = spec.toggled.map(|t| match t {
+            Toggled::True => "true",
+            Toggled::False | Toggled::Mixed => "false",
+        });
+        set_optional_attr(element, "aria-selected", selected);
+    } else if matches!(
+        effective_role,
+        Some("checkbox" | "radio" | "switch" | "menuitemcheckbox" | "menuitemradio")
+    ) || matches!(spec.input_type, Some("checkbox" | "radio"))
+    {
+        let _ = element.remove_attribute("aria-pressed");
+        let _ = element.remove_attribute("aria-selected");
+        set_optional_attr(element, "aria-checked", toggled_str);
     } else {
         let _ = element.remove_attribute("aria-pressed");
-        match spec.toggled {
-            Some(Toggled::True) => {
-                let _ = element.set_attribute("aria-checked", "true");
-            }
-            Some(Toggled::False) => {
-                let _ = element.set_attribute("aria-checked", "false");
-            }
-            Some(Toggled::Mixed) => {
-                let _ = element.set_attribute("aria-checked", "mixed");
-            }
-            None => {
-                let _ = element.remove_attribute("aria-checked");
-            }
-        }
+        let _ = element.remove_attribute("aria-checked");
+        let _ = element.remove_attribute("aria-selected");
     }
 
     if spec.focusable && !spec.disabled && !natively_focusable(spec.tag) {
@@ -1195,7 +1405,11 @@ fn apply_dom_attributes(
     } else if matches!(
         spec.tag,
         DomTag::Span | DomTag::Heading | DomTag::Anchor | DomTag::ListItem
-    ) {
+    ) || (spec.tag == DomTag::Button && effective_role == Some("combobox"))
+        || (spec.tag == DomTag::Div
+            && matches!(effective_role, Some("option" | "listitem"))
+            && element.first_element_child().is_none())
+    {
         let text = spec.value.as_deref().or(spec.label.as_deref()).unwrap_or("");
         if element.text_content().as_deref() != Some(text) {
             element.set_text_content(Some(text));

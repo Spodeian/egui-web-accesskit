@@ -18,6 +18,11 @@ test.describe("egui-web-accesskit E2E", () => {
       name: "egui-web-accesskit demo",
       level: 1,
     });
+    const moreHeading = overlay.getByRole("heading", {
+      name: "More controls",
+      level: 2,
+    });
+    const liveStatus = overlay.locator('[aria-live="polite"]');
     const incBtn = overlay.getByRole("button", { name: "Increment counter" });
     const notifyCheckbox = overlay.getByRole("checkbox", {
       name: "Enable notifications",
@@ -30,8 +35,19 @@ test.describe("egui-web-accesskit E2E", () => {
     const docsLink = overlay.getByRole("link", { name: "egui docs" });
     const noteBox = overlay.getByRole("textbox", { name: "Note:" });
     const detailsBtn = overlay.getByRole("button", { name: "Advanced details" });
+    const muteBtn = overlay.getByRole("button", { name: "Mute audio" });
+    const compactRadio = overlay.getByRole("radio", { name: "Compact" });
+    const spaciousRadio = overlay.getByRole("radio", { name: "Spacious" });
+    const lockedBtn = overlay.getByRole("button", { name: "Locked action" });
+    const retriesSpin = overlay.getByRole("spinbutton", { name: "Retries:" });
+    const progressBar = overlay.getByRole("progressbar", {
+      name: "Sync progress",
+    });
+    const themeCombo = overlay.getByRole("combobox", { name: "Theme" });
 
     await expect(heading).toHaveAttribute("aria-level", "1");
+    await expect(moreHeading).toHaveAttribute("aria-level", "2");
+    await expect(liveStatus).toHaveText("Audio active");
     await expect(incBtn).toBeAttached();
     await expect(incBtn).toHaveAttribute(
       "aria-description",
@@ -47,6 +63,18 @@ test.describe("egui-web-accesskit E2E", () => {
     await expect(docsLink).toHaveAttribute("href", "https://docs.rs/egui");
     await expect(noteBox).toHaveValue("Type here");
     await expect(detailsBtn).toHaveAttribute("aria-expanded", "false");
+    await expect(muteBtn).toHaveAttribute("aria-pressed", "false");
+    await expect(compactRadio).toHaveAttribute("aria-checked", "true");
+    await expect(spaciousRadio).toHaveAttribute("aria-checked", "false");
+    await expect(lockedBtn).toBeDisabled();
+    await expect(lockedBtn).toHaveAttribute("aria-disabled", "true");
+    await expect(retriesSpin).toHaveAttribute("min", "0");
+    await expect(retriesSpin).toHaveAttribute("max", "10");
+    await expect(retriesSpin).toHaveAttribute("step", "1");
+    await expect(retriesSpin).toHaveValue("3");
+    await expect(progressBar).toHaveAttribute("aria-valuenow", "75");
+    await expect(themeCombo).toHaveAttribute("aria-expanded", "false");
+    await expect(themeCombo).toHaveText("Dark");
 
     const axeResults = await new AxeBuilder({ page })
       .include('[data-egui-accesskit="true"]')
@@ -54,9 +82,63 @@ test.describe("egui-web-accesskit E2E", () => {
       .analyze();
     expect(axeResults.violations).toEqual([]);
 
-    // 2. Idle wakeup & click round-trip
+    // 2. Idle wakeup & click round-trip + toggle button, live region, radio group, spinbutton
     await incBtn.evaluate((el) => el.click());
     await expect(overlay.getByText("Button clicked 1 times")).toBeAttached();
+
+    await muteBtn.evaluate((el) => el.click());
+    await expect(muteBtn).toHaveAttribute("aria-pressed", "true");
+    await expect(liveStatus).toHaveText("Audio muted");
+
+    await spaciousRadio.evaluate((el) => el.click());
+    await expect(spaciousRadio).toHaveAttribute("aria-checked", "true");
+    await expect(compactRadio).toHaveAttribute("aria-checked", "false");
+
+    await retriesSpin.evaluate((el) => {
+      el.focus();
+      el.value = "7";
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await expect(retriesSpin).toHaveValue("7");
+
+    // 2b. ComboBox open popup, hoisted options, axe-core check while open, keyboard Enter, and close
+    await themeCombo.evaluate((el) => el.click());
+    await expect(themeCombo).toHaveAttribute("aria-expanded", "true");
+    const controlsId = await themeCombo.getAttribute("aria-controls");
+    expect(controlsId).toBeTruthy();
+    const listbox = overlay.getByRole("listbox");
+    await expect(listbox).toBeAttached();
+    const lightOpt = overlay.getByRole("option", { name: "Light" });
+    await expect(lightOpt).toBeAttached();
+    await expect(lightOpt).toHaveAttribute("aria-selected", "false");
+
+    const comboAxe = await new AxeBuilder({ page })
+      .include('[data-egui-accesskit="true"]')
+      .disableRules(["color-contrast"])
+      .analyze();
+    expect(comboAxe.violations).toEqual([]);
+
+    await lightOpt.focus();
+    await page.keyboard.press("Enter");
+    await expect(themeCombo).toHaveText("Light");
+    await expect(lightOpt).toHaveAttribute("aria-selected", "true");
+    await themeCombo.evaluate((el) => el.click());
+    await expect(themeCombo).toHaveAttribute("aria-expanded", "false");
+
+    // 2c. Modal AlertDialog + axe-core check while open + close
+    await overlay.getByRole("button", { name: "Open dialog" }).evaluate((el) => el.click());
+    const modal = overlay.getByRole("alertdialog", { name: "Confirmation dialog" });
+    await expect(modal).toBeAttached();
+    await expect(modal).toHaveAttribute("aria-modal", "true");
+
+    const modalAxe = await new AxeBuilder({ page })
+      .include('[data-egui-accesskit="true"]')
+      .disableRules(["color-contrast"])
+      .analyze();
+    expect(modalAxe.violations).toEqual([]);
+
+    await overlay.getByRole("button", { name: "Close dialog" }).evaluate((el) => el.click());
+    await expect(modal).toHaveCount(0);
 
     // 3. Disclosure click & aria-expanded update
     await detailsBtn.evaluate((el) => el.click());
@@ -139,7 +221,19 @@ test.describe("egui-web-accesskit E2E", () => {
     await page.keyboard.type("newpass12");
     await expect(overlay.getByText("Secret length: 9")).toBeAttached();
 
-    // 8. ScrollArea ScrollIntoView on DOM focus
+    // 8. ScrollArea ScrollIntoView on DOM focus + PageDown/PageUp scroll actions
+    const topItemBtn = overlay.getByRole("button", { name: "Top item" });
+    const topBefore = await topItemBtn.boundingBox();
+    expect(topBefore).not.toBeNull();
+    await topItemBtn.focus();
+    await page.keyboard.press("PageDown");
+    await expect
+      .poll(async () => {
+        const b = await topItemBtn.boundingBox();
+        return b ? b.y : topBefore.y;
+      })
+      .toBeLessThan(topBefore.y - 20);
+
     const bottomBtn = overlay.getByRole("button", { name: "Bottom action" });
     const bottomBefore = await bottomBtn.boundingBox();
     expect(bottomBefore).not.toBeNull();
@@ -150,6 +244,15 @@ test.describe("egui-web-accesskit E2E", () => {
         return b ? b.y : bottomBefore.y;
       })
       .toBeLessThan(bottomBefore.y - 20);
+
+    const bottomCentered = await bottomBtn.boundingBox();
+    await page.keyboard.press("PageUp");
+    await expect
+      .poll(async () => {
+        const b = await bottomBtn.boundingBox();
+        return b ? b.y : bottomCentered.y;
+      })
+      .toBeGreaterThan(bottomCentered.y + 20);
 
     // 9. Idle outer-page scroll/offset realigns overlay without waking egui
     const incBeforeScroll = await incBtn.boundingBox();
