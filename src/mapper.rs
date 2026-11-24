@@ -126,7 +126,58 @@ pub enum DomOp {
 
 /// Maps an AccessKit consumer node into a [`DomNodeSpec`].
 pub fn map_node(node: &Node<'_>) -> DomNodeSpec {
-    let (tag, aria_role, input_type) = map_role(node.role());
+    let (mut tag, mut aria_role, mut input_type) = map_role(node.role());
+    match node.role() {
+        Role::Label if node.url().is_some_and(|u| !u.is_empty()) => {
+            tag = DomTag::Anchor;
+            aria_role = None;
+        }
+        Role::Button if node.toggled().is_some() && has_ancestor_role(node, Role::ListBox) => {
+            tag = DomTag::Div;
+            aria_role = Some("option");
+            input_type = None;
+        }
+        Role::ListBox
+            if !has_descendant(node, &|c| {
+                c.role() == Role::ListBoxOption
+                    || (c.role() == Role::Button && c.toggled().is_some())
+            }) =>
+        {
+            aria_role = Some("group");
+        }
+        Role::ListBoxOption if !has_ancestor_role(node, Role::ListBox) => {
+            tag = DomTag::Button;
+            aria_role = None;
+        }
+        Role::Tab if !has_ancestor_role(node, Role::TabList) => {
+            aria_role = None;
+        }
+        Role::TabList if !has_descendant(node, &|c| c.role() == Role::Tab) => {
+            aria_role = Some("group");
+        }
+        Role::MenuItem | Role::MenuItemCheckBox | Role::MenuItemRadio
+            if !(has_ancestor_role(node, Role::Menu) || has_ancestor_role(node, Role::MenuBar)) =>
+        {
+            match node.role() {
+                Role::MenuItem => {
+                    tag = DomTag::Button;
+                    aria_role = None;
+                }
+                Role::MenuItemCheckBox => {
+                    tag = DomTag::Input;
+                    aria_role = Some("checkbox");
+                    input_type = Some("checkbox");
+                }
+                Role::MenuItemRadio => {
+                    tag = DomTag::Input;
+                    aria_role = Some("radio");
+                    input_type = Some("radio");
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
 
     let label = node.label().filter(|s| !s.is_empty());
     let description = node.description().filter(|s| !s.is_empty());
@@ -185,13 +236,41 @@ pub fn map_node(node: &Node<'_>) -> DomNodeSpec {
     }
 }
 
+fn has_ancestor_role(node: &Node<'_>, target: Role) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.role() == target {
+            return true;
+        }
+        current = parent.parent();
+    }
+    false
+}
+
+fn has_descendant(node: &Node<'_>, pred: &impl Fn(&Node<'_>) -> bool) -> bool {
+    let mut stack: Vec<_> = node.children().collect();
+    while let Some(child) = stack.pop() {
+        if should_skip_node(&child) {
+            continue;
+        }
+        if pred(&child) {
+            return true;
+        }
+        stack.extend(child.children());
+    }
+    false
+}
+
 fn map_role(role: Role) -> (DomTag, Option<&'static str>, Option<&'static str>) {
     match role {
         Role::Button | Role::DefaultButton | Role::DisclosureTriangle => {
             (DomTag::Button, None, None)
         }
         Role::Tab => (DomTag::Button, Some("tab"), None),
+        Role::TabList => (DomTag::Div, Some("tablist"), None),
         Role::MenuItem => (DomTag::Button, Some("menuitem"), None),
+        Role::MenuItemCheckBox => (DomTag::Button, Some("menuitemcheckbox"), None),
+        Role::MenuItemRadio => (DomTag::Button, Some("menuitemradio"), None),
         Role::CheckBox => (DomTag::Input, Some("checkbox"), Some("checkbox")),
         Role::Switch => (DomTag::Input, Some("switch"), Some("checkbox")),
         Role::RadioButton => (DomTag::Input, Some("radio"), Some("radio")),
@@ -208,14 +287,16 @@ fn map_role(role: Role) -> (DomTag, Option<&'static str>, Option<&'static str>) 
         Role::Link => (DomTag::Anchor, None, None),
         Role::Heading => (DomTag::Heading, Some("heading"), None),
         Role::List => (DomTag::List, None, None),
-        Role::ListBox => (DomTag::List, Some("listbox"), None),
+        Role::ListBox => (DomTag::Div, Some("listbox"), None),
         Role::ListItem => (DomTag::ListItem, None, None),
-        Role::ListBoxOption => (DomTag::ListItem, Some("option"), None),
+        Role::ListBoxOption => (DomTag::Div, Some("option"), None),
         Role::Window | Role::Region | Role::ScrollView | Role::Pane => (DomTag::Region, None, None),
         Role::Dialog => (DomTag::Div, Some("dialog"), None),
         Role::AlertDialog => (DomTag::Div, Some("alertdialog"), None),
         Role::Alert => (DomTag::Div, Some("alert"), None),
-        Role::ComboBox | Role::EditableComboBox => (DomTag::Div, Some("combobox"), None),
+        Role::Status => (DomTag::Div, Some("status"), None),
+        Role::ComboBox => (DomTag::Button, Some("combobox"), None),
+        Role::EditableComboBox => (DomTag::Input, Some("combobox"), Some("text")),
         Role::ProgressIndicator => (DomTag::Div, Some("progressbar"), None),
         Role::Meter => (DomTag::Div, Some("meter"), None),
         Role::RadioGroup => (DomTag::Div, Some("radiogroup"), None),
@@ -267,6 +348,18 @@ impl TreeBridge {
             self.tree = Some(tree);
             ops
         }
+    }
+
+    /// Whether `target_node` advertises support for programmatic text editing actions.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub(crate) fn supports_text_edit_actions(&self, target_node: NodeId) -> bool {
+        self.tree
+            .as_ref()
+            .and_then(|t| t.state().node_by_tree_local_id(target_node, TreeId::ROOT))
+            .is_some_and(|n| {
+                n.data().supports_action(Action::SetValue)
+                    || n.data().supports_action(Action::ReplaceSelectedText)
+            })
     }
 
     /// Resolves UTF-16 selection offsets for `target_node` into an AccessKit `SetTextSelection` request.
@@ -649,6 +742,117 @@ mod tests {
         });
         assert!(disclosure.clickable);
         assert_eq!(disclosure.expanded, None);
+    }
+
+    #[test]
+    fn maps_showcase_widgets_and_listbox_context_roles() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        let mut density = 0_u8;
+        let mut muted = true;
+        let mut retries = 3_i32;
+        let mut choice = 0_usize;
+
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let _ = ui.add(egui::Button::new("Mute audio").selected(muted));
+            let _ = ui.radio_value(&mut density, 0, "Compact");
+            let _ = ui.radio_value(&mut density, 1, "Spacious");
+            let _ = ui.add_enabled(false, egui::Button::new("Locked action"));
+            let _ = ui.add(egui::DragValue::new(&mut retries).range(0..=10).speed(1.0));
+            let _ = ui.add(egui::ProgressBar::new(0.75).text("Sync progress"));
+            egui::ComboBox::from_label("Theme").show_index(ui, &mut choice, 2, |i| {
+                ["Dark", "Light"][i]
+            });
+            let _ = &mut muted;
+        });
+
+        let update = output
+            .platform_output
+            .accesskit_update
+            .take()
+            .expect("accesskit_update must be emitted");
+        output.drop_without_applying_deltas();
+
+        let mut bridge = TreeBridge::new();
+        let ops = bridge.apply_update(update);
+
+        let toggle_btn = find_upsert(&ops, |s| {
+            s.tag == DomTag::Button && s.label.as_deref() == Some("Mute audio")
+        });
+        assert_eq!(toggle_btn.toggled, Some(Toggled::True));
+
+        let radio = find_upsert(&ops, |s| {
+            s.aria_role == Some("radio") && s.label.as_deref() == Some("Compact")
+        });
+        assert_eq!(radio.tag, DomTag::Input);
+        assert_eq!(radio.input_type, Some("radio"));
+        assert_eq!(radio.toggled, Some(Toggled::True));
+
+        let disabled_btn = find_upsert(&ops, |s| {
+            s.tag == DomTag::Button && s.label.as_deref() == Some("Locked action")
+        });
+        assert!(disabled_btn.disabled);
+
+        let spin = find_upsert(&ops, |s| s.aria_role == Some("spinbutton"));
+        assert_eq!(spin.tag, DomTag::Input);
+        assert_eq!(spin.input_type, Some("number"));
+        assert_eq!(spin.numeric_value, Some(3.0));
+
+        let progress = find_upsert(&ops, |s| {
+            s.aria_role == Some("progressbar") && s.label.as_deref() == Some("Sync progress")
+        });
+        assert_eq!(progress.tag, DomTag::Div);
+        assert_eq!(progress.numeric_value, Some(75.0));
+
+        let combo = find_upsert(&ops, |s| {
+            s.aria_role == Some("combobox") && s.label.as_deref() == Some("Theme")
+        });
+        assert_eq!(combo.tag, DomTag::Button);
+        assert_eq!(combo.value.as_deref(), Some("Dark"));
+
+        // Verify ListBox ancestor turns selectable Button into option, and empty ListBox into group.
+        let root_id = NodeId(10);
+        let filled_lb_id = NodeId(11);
+        let opt_btn_id = NodeId(12);
+        let empty_lb_id = NodeId(13);
+
+        let mut root = AccessKitNode::new(Role::Window);
+        root.set_children(vec![filled_lb_id, empty_lb_id]);
+
+        let mut filled_lb = AccessKitNode::new(Role::ListBox);
+        filled_lb.set_children(vec![opt_btn_id]);
+
+        let mut opt_btn = AccessKitNode::new(Role::Button);
+        opt_btn.set_label("Light");
+        opt_btn.set_toggled(Toggled::False);
+
+        let empty_lb = AccessKitNode::new(Role::ListBox);
+
+        let synth_update = TreeUpdate {
+            nodes: vec![
+                (root_id, root),
+                (filled_lb_id, filled_lb),
+                (opt_btn_id, opt_btn),
+                (empty_lb_id, empty_lb),
+            ],
+            tree: Some(AccessKitTreeInfo::new(root_id)),
+            tree_id: TreeId::ROOT,
+            focus: root_id,
+        };
+        let mut synth_bridge = TreeBridge::new();
+        let synth_ops = synth_bridge.apply_update(synth_update);
+
+        let lb = find_upsert(&synth_ops, |s| s.id == filled_lb_id);
+        assert_eq!(lb.aria_role, Some("listbox"));
+
+        let opt = find_upsert(&synth_ops, |s| s.id == opt_btn_id);
+        assert_eq!(opt.tag, DomTag::Div);
+        assert_eq!(opt.aria_role, Some("option"));
+        assert_eq!(opt.toggled, Some(Toggled::False));
+
+        let empty_lb_spec = find_upsert(&synth_ops, |s| s.id == empty_lb_id);
+        assert_eq!(empty_lb_spec.aria_role, Some("group"));
     }
 
     #[test]

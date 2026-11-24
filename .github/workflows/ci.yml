@@ -32,7 +32,6 @@ jobs:
         run: cargo doc --no-deps --target wasm32-unknown-unknown
 
   e2e:
-    if: github.ref == 'refs/heads/main' || github.base_ref == 'main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -51,5 +50,5 @@ jobs:
       - working-directory: e2e
         run: |
           npm ci
-          npx playwright install chrome
+          npx playwright install --with-deps chrome
           npm test
