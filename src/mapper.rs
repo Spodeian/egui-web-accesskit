@@ -1,3 +1,8 @@
+//! Platform-independent translation from `accesskit_consumer` trees into minimal DOM mutations.
+//!
+//! Most applications only need [`crate::WebAccessKitPlugin`]; this module is exposed for
+//! headless testing and custom DOM hosts.
+
 use accesskit_consumer::{FilterResult, Node, Tree, TreeChangeHandler};
 use egui::accesskit::{
     Action, ActionData, ActionRequest, Live, NodeId, Rect, Role, TextSelection, Toggled, TreeId,
@@ -7,15 +12,25 @@ use egui::accesskit::{
 /// Semantic HTML element tag chosen for an AccessKit node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DomTag {
+    /// Generic container (`<div>`).
     Div,
+    /// Action or disclosure button (`<button>`).
     Button,
+    /// Single-line form input, checkbox, radio button, or range slider (`<input>`).
     Input,
+    /// Multiline text input (`<textarea>`).
     TextArea,
+    /// Inline static text (`<span>`).
     Span,
+    /// Hyperlink (`<a>`).
     Anchor,
+    /// Section heading (`<h1>`–`<h6>` or `<div role="heading">` above level 6).
     Heading,
+    /// List container (`<ul>`).
     List,
+    /// List entry or option (`<li>`).
     ListItem,
+    /// Landmark or grouping section (`<section>`).
     Region,
 }
 
@@ -40,36 +55,72 @@ impl DomTag {
 /// Platform-independent snapshot of the DOM properties for one AccessKit node.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DomNodeSpec {
+    /// AccessKit node identifier local to `TreeId::ROOT`.
     pub id: NodeId,
+    /// HTML tag chosen for this node.
     pub tag: DomTag,
+    /// Explicit WAI-ARIA `role` attribute override, if needed.
     pub aria_role: Option<&'static str>,
+    /// HTML `<input type="...">` attribute when [`Self::tag`] is [`DomTag::Input`].
     pub input_type: Option<&'static str>,
+    /// Accessible name (`aria-label` or fallback text content).
     pub label: Option<String>,
+    /// Accessible description mapped to `aria-description`.
+    pub description: Option<String>,
+    /// Textual value (`value`, `textContent`, or `aria-valuetext` on sliders).
     pub value: Option<String>,
+    /// Input placeholder text mapped to `placeholder`.
     pub placeholder: Option<String>,
+    /// Hyperlink target URL mapped to safe `<a href="...">` values.
+    pub url: Option<String>,
+    /// Toggle or checkbox state (`aria-pressed` or `aria-checked`).
     pub toggled: Option<Toggled>,
+    /// Disclosure expansion state (`aria-expanded`).
     pub expanded: Option<bool>,
+    /// Whether the node accepts click actions.
     pub clickable: bool,
+    /// Whether the control is disabled (`disabled` / `aria-disabled`).
     pub disabled: bool,
+    /// Whether the control is explicitly read-only (`readonly` / `aria-readonly`).
     pub read_only: bool,
+    /// Whether the node can receive keyboard focus.
     pub focusable: bool,
+    /// Heading level (`1..`) mirrored to `aria-level` and native `<h1>`–`<h6>` tags.
     pub heading_level: Option<usize>,
+    /// Whether dialogs block underlying content (`aria-modal="true"`).
     pub modal: bool,
+    /// Live region politeness level (`aria-live`).
     pub live: Option<Live>,
+    /// Current numeric value for range controls (`aria-valuenow`).
     pub numeric_value: Option<f64>,
+    /// Minimum numeric value for range controls (`aria-valuemin` / `min`).
     pub numeric_min: Option<f64>,
+    /// Maximum numeric value for range controls (`aria-valuemax` / `max`).
     pub numeric_max: Option<f64>,
+    /// Step increment for range controls (`step`, or `"any"` when `None`).
     pub numeric_step: Option<f64>,
+    /// Text selection `(anchor, focus)` measured in UTF-16 code units.
     pub text_selection: Option<(usize, usize)>,
+    /// Node bounding box in physical `egui` pixels (`bounds / devicePixelRatio` in CSS px).
     pub bounds: Option<Rect>,
 }
 
 /// Incremental DOM mutation produced by [`TreeBridge::apply_update`].
 #[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum DomOp {
+    /// Insert or update an element matching `DomNodeSpec`.
     Upsert(DomNodeSpec),
-    SetChildren { parent: NodeId, children: Vec<NodeId> },
+    /// Reorder or attach the child list under `parent`.
+    SetChildren {
+        /// Parent node whose child elements should match `children`.
+        parent: NodeId,
+        /// Ordered child node IDs (excluding skipped inline `TextRun`s).
+        children: Vec<NodeId>,
+    },
+    /// Remove a previously mirrored element.
     Remove(NodeId),
+    /// Move DOM focus to the target node, if present.
     SetFocus(Option<NodeId>),
 }
 
@@ -78,6 +129,7 @@ pub fn map_node(node: &Node<'_>) -> DomNodeSpec {
     let (tag, aria_role, input_type) = map_role(node.role());
 
     let label = node.label().filter(|s| !s.is_empty());
+    let description = node.description().filter(|s| !s.is_empty());
     // `value()` skips text-range extraction on multiline text inputs, so
     // fall back to the raw value string when present.
     let value = node
@@ -88,6 +140,7 @@ pub fn map_node(node: &Node<'_>) -> DomNodeSpec {
         .placeholder()
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
+    let url = node.url().filter(|s| !s.is_empty()).map(str::to_owned);
 
     let text_selection = if node.is_text_input() && node.supports_text_ranges() {
         node.text_selection_anchor()
@@ -108,8 +161,10 @@ pub fn map_node(node: &Node<'_>) -> DomNodeSpec {
         aria_role,
         input_type,
         label,
+        description,
         value,
         placeholder,
+        url,
         toggled: node.toggled(),
         expanded: node.data().is_expanded(),
         clickable: node.is_clickable(&|_| FilterResult::Include),
@@ -141,6 +196,7 @@ fn map_role(role: Role) -> (DomTag, Option<&'static str>, Option<&'static str>) 
         Role::Switch => (DomTag::Input, Some("switch"), Some("checkbox")),
         Role::RadioButton => (DomTag::Input, Some("radio"), Some("radio")),
         Role::Slider => (DomTag::Input, Some("slider"), Some("range")),
+        Role::SpinButton => (DomTag::Input, Some("spinbutton"), Some("number")),
         Role::TextInput => (DomTag::Input, None, Some("text")),
         Role::SearchInput => (DomTag::Input, None, Some("search")),
         Role::EmailInput => (DomTag::Input, None, Some("email")),
@@ -155,14 +211,13 @@ fn map_role(role: Role) -> (DomTag, Option<&'static str>, Option<&'static str>) 
         Role::ListBox => (DomTag::List, Some("listbox"), None),
         Role::ListItem => (DomTag::ListItem, None, None),
         Role::ListBoxOption => (DomTag::ListItem, Some("option"), None),
-        Role::Window | Role::Region | Role::ScrollView | Role::Pane => {
-            (DomTag::Region, Some("region"), None)
-        }
+        Role::Window | Role::Region | Role::ScrollView | Role::Pane => (DomTag::Region, None, None),
         Role::Dialog => (DomTag::Div, Some("dialog"), None),
         Role::AlertDialog => (DomTag::Div, Some("alertdialog"), None),
         Role::Alert => (DomTag::Div, Some("alert"), None),
         Role::ComboBox | Role::EditableComboBox => (DomTag::Div, Some("combobox"), None),
         Role::ProgressIndicator => (DomTag::Div, Some("progressbar"), None),
+        Role::Meter => (DomTag::Div, Some("meter"), None),
         Role::RadioGroup => (DomTag::Div, Some("radiogroup"), None),
         Role::Group => (DomTag::Div, Some("group"), None),
         _ => (DomTag::Div, None, None),
@@ -190,6 +245,7 @@ pub struct TreeBridge {
 }
 
 impl TreeBridge {
+    /// Creates an empty [`TreeBridge`] awaiting the first AccessKit [`TreeUpdate`].
     pub fn new() -> Self {
         Self { tree: None }
     }
@@ -381,6 +437,16 @@ pub fn set_value_action(target_node: NodeId, value: String) -> ActionRequest {
     }
 }
 
+/// Builds an AccessKit [`Action::ReplaceSelectedText`] string request for the root tree.
+pub fn replace_selected_text_action(target_node: NodeId, value: String) -> ActionRequest {
+    ActionRequest {
+        action: Action::ReplaceSelectedText,
+        target_tree: TreeId::ROOT,
+        target_node,
+        data: Some(ActionData::Value(value.into_boxed_str())),
+    }
+}
+
 /// Builds an AccessKit [`Action::SetValue`] numeric request for the root tree.
 pub fn set_numeric_value_action(target_node: NodeId, value: f64) -> ActionRequest {
     ActionRequest {
@@ -433,7 +499,7 @@ mod tests {
     use super::*;
     use egui::accesskit::{Node as AccessKitNode, Tree as AccessKitTreeInfo};
 
-    fn find_upsert<'a>(ops: &'a [DomOp], pred: impl Fn(&DomNodeSpec) -> bool) -> &'a DomNodeSpec {
+    fn find_upsert(ops: &[DomOp], pred: impl Fn(&DomNodeSpec) -> bool) -> &DomNodeSpec {
         ops.iter()
             .find_map(|op| match op {
                 DomOp::Upsert(spec) if pred(spec) => Some(spec),
@@ -454,6 +520,7 @@ mod tests {
         let mut text = String::from("hello");
         let mut bio = String::from("line1\nline2");
         let mut ro_token: &str = "RO-123";
+        let mut secret = String::from("s3cr3t");
 
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             let _ = ui.button("Save");
@@ -469,6 +536,7 @@ mod tests {
             ui.text_edit_singleline(&mut text);
             ui.add(egui::TextEdit::multiline(&mut bio).hint_text("Write bio"));
             ui.text_edit_singleline(&mut ro_token);
+            ui.add(egui::TextEdit::singleline(&mut secret).password(true));
             egui::CollapsingHeader::new("Advanced details").show(ui, |ui| {
                 ui.label("Hidden");
             });
@@ -536,6 +604,13 @@ mod tests {
         assert_eq!(volume_slider.numeric_value, Some(45.0));
         assert_eq!(volume_slider.numeric_step, Some(5.0));
 
+        let volume_spin = find_upsert(&ops, |s| {
+            s.aria_role == Some("spinbutton") && s.label.as_deref() == Some("Volume")
+        });
+        assert_eq!(volume_spin.tag, DomTag::Input);
+        assert_eq!(volume_spin.input_type, Some("number"));
+        assert_eq!(volume_spin.numeric_value, Some(45.0));
+
         let label = find_upsert(&ops, |s| {
             s.tag == DomTag::Span && s.value.as_deref() == Some("Status text")
         });
@@ -558,6 +633,16 @@ mod tests {
             s.tag == DomTag::Input && s.value.as_deref() == Some("RO-123")
         });
 
+        let pw_input = find_upsert(&ops, |s| {
+            s.tag == DomTag::Input && s.input_type == Some("password")
+        });
+        let masked = pw_input
+            .value
+            .as_deref()
+            .expect("password input must expose masked value");
+        assert_eq!(masked.chars().count(), 6);
+        assert!(!masked.chars().any(|c| c == 's' || c == '3'));
+
         let disclosure = find_upsert(&ops, |s| {
             s.tag == DomTag::Button && s.label.as_deref() == Some("Advanced details")
         });
@@ -573,9 +658,10 @@ mod tests {
         let alert_id = NodeId(4);
         let text_id = NodeId(5);
         let run_id = NodeId(6);
+        let link_id = NodeId(7);
 
         let mut root = AccessKitNode::new(Role::Window);
-        root.set_children(vec![heading_id, dialog_id, alert_id, text_id]);
+        root.set_children(vec![heading_id, dialog_id, alert_id, text_id, link_id]);
 
         let mut heading = AccessKitNode::new(Role::Heading);
         heading.set_level(3);
@@ -596,6 +682,11 @@ mod tests {
         run.set_value("abc def");
         run.set_character_lengths([1, 1, 1, 1, 1, 1, 1]);
 
+        let mut link = AccessKitNode::new(Role::Link);
+        link.set_label("egui docs");
+        link.set_url("https://docs.rs/egui");
+        link.set_description("External docs");
+
         let update = TreeUpdate {
             nodes: vec![
                 (root_id, root),
@@ -604,6 +695,7 @@ mod tests {
                 (alert_id, alert),
                 (text_id, text),
                 (run_id, run),
+                (link_id, link),
             ],
             tree: Some(AccessKitTreeInfo::new(root_id)),
             tree_id: TreeId::ROOT,
@@ -631,6 +723,11 @@ mod tests {
             .set_text_selection_action(text_id, 1, 5)
             .expect("synthetic TextInput with TextRun must resolve UTF-16 selection");
         assert_eq!(sel.action, Action::SetTextSelection);
+
+        let l = find_upsert(&ops, |s| s.id == link_id);
+        assert_eq!(l.tag, DomTag::Anchor);
+        assert_eq!(l.url.as_deref(), Some("https://docs.rs/egui"));
+        assert_eq!(l.description.as_deref(), Some("External docs"));
     }
 
     #[test]
@@ -668,7 +765,7 @@ mod tests {
         assert_eq!(updated_checkbox.toggled, Some(Toggled::True));
 
         assert!(
-            ops2.iter().any(|op| *op == DomOp::Remove(temp_id)),
+            ops2.contains(&DomOp::Remove(temp_id)),
             "expected Remove for hidden button in {ops2:?}"
         );
     }
