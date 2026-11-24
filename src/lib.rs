@@ -144,11 +144,6 @@ impl egui::Plugin for WebAccessKitPlugin {
             bridge.apply_update(update);
         });
     }
-
-    #[cfg(target_arch = "wasm32")]
-    fn on_exit(&mut self, _ctx: &egui::Context) {
-        dom::remove_bridge(self.bridge_id);
-    }
 }
 
 #[cfg(test)]
