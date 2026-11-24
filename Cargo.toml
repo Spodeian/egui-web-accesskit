@@ -1,0 +1,31 @@
+[package]
+name = "egui-web-accesskit"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Drop-in egui Plugin that mirrors AccessKit trees to the browser DOM on wasm32"
+readme = "README.md"
+keywords = ["egui", "accesskit", "accessibility", "wasm", "web"]
+categories = ["accessibility", "gui", "wasm"]
+
+[dependencies]
+accesskit = "0.25"
+accesskit_consumer = "0.39.2"
+egui = { version = "0.37.0", default-features = false }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = [
+    "CssStyleDeclaration",
+    "Document",
+    "DomRect",
+    "Element",
+    "Event",
+    "EventTarget",
+    "FocusEvent",
+    "HtmlElement",
+    "HtmlInputElement",
+    "KeyboardEvent",
+    "Node",
+    "Window",
+] }
