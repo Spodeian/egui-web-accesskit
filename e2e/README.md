@@ -21,6 +21,16 @@ End-to-end browser verification for `egui-web-accesskit` using Playwright, headl
 - [serve.mjs](serve.mjs) serves `../examples/demo/dist` on `http://127.0.0.1:4173`.
 - [playwright.config.mjs](playwright.config.mjs) starts `serve.mjs` automatically via `webServer`, runs against `channel: "chrome"` with `--use-gl=angle --use-angle=swiftshader` for software WebGL rendering, and enforces a 30s per-test timeout.
 
+## Formatting
+
+```sh
+# Verify formatting (Prettier, configured in .prettierrc.json)
+npm run format:check
+
+# Rewrite files in place
+npm run format
+```
+
 ## Running Tests
 
 ```sh

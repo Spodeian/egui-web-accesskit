@@ -13,8 +13,16 @@ export default defineConfig({
       use: {
         // Set PW_CHROME_PATH to run against a specific Chromium binary instead of Chrome.
         ...(process.env.PW_CHROME_PATH
-          ? { launchOptions: { executablePath: process.env.PW_CHROME_PATH, args: ["--use-gl=angle", "--use-angle=swiftshader", "--no-sandbox"] } }
-          : { channel: "chrome", launchOptions: { args: ["--use-gl=angle", "--use-angle=swiftshader"] } }),
+          ? {
+              launchOptions: {
+                executablePath: process.env.PW_CHROME_PATH,
+                args: ["--use-gl=angle", "--use-angle=swiftshader", "--no-sandbox"],
+              },
+            }
+          : {
+              channel: "chrome",
+              launchOptions: { args: ["--use-gl=angle", "--use-angle=swiftshader"] },
+            }),
       },
     },
     {

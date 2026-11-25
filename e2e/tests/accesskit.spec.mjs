@@ -49,10 +49,7 @@ test.describe("egui-web-accesskit E2E", () => {
     await expect(moreHeading).toHaveAttribute("aria-level", "2");
     await expect(liveStatus).toHaveText("Audio active");
     await expect(incBtn).toBeAttached();
-    await expect(incBtn).toHaveAttribute(
-      "aria-description",
-      "Adds one to the click counter"
-    );
+    await expect(incBtn).toHaveAttribute("aria-description", "Adds one to the click counter");
     await expect(notifyCheckbox).toHaveAttribute("aria-checked", "false");
     await expect(triCheckbox).toHaveAttribute("aria-checked", "mixed");
     await expect(opacitySlider).toHaveAttribute("step", "any");
@@ -158,9 +155,7 @@ test.describe("egui-web-accesskit E2E", () => {
     // 4. Unstepped float slider preserves 0.35 and steps on ArrowRight
     await opacitySlider.focus();
     await page.keyboard.press("ArrowRight");
-    await expect
-      .poll(async () => Number(await opacitySlider.inputValue()))
-      .toBeGreaterThan(0.35);
+    await expect.poll(async () => Number(await opacitySlider.inputValue())).toBeGreaterThan(0.35);
 
     // 5. Sibling insertion above focused textbox keeps DOM focus, and clear resets value
     await noteBox.evaluate((el) => {
@@ -170,17 +165,13 @@ test.describe("egui-web-accesskit E2E", () => {
     await page.keyboard.type("!hello");
     await expect(overlay.getByText("Warning banner")).toBeAttached();
     await expect(noteBox).toHaveValue("!hello");
-    const stillFocused = await noteBox.evaluate(
-      (el) => el === document.activeElement
-    );
+    const stillFocused = await noteBox.evaluate((el) => el === document.activeElement);
     expect(stillFocused).toBe(true);
 
     await page.keyboard.press("Enter");
     await expect(overlay.getByText("Note submits: 1")).toBeAttached();
 
-    await overlay.getByRole("button", { name: "Clear note" }).evaluate((el) =>
-      el.click()
-    );
+    await overlay.getByRole("button", { name: "Clear note" }).evaluate((el) => el.click());
     await expect(noteBox).toHaveValue("");
 
     // 5b. IME composition defers sync until compositionend commits
@@ -203,15 +194,11 @@ test.describe("egui-web-accesskit E2E", () => {
     await expect(noteBox).toHaveValue("ka");
     await noteBox.evaluate((el) => {
       el.value = "漢";
-      el.dispatchEvent(
-        new CompositionEvent("compositionend", { bubbles: true, data: "漢" })
-      );
+      el.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "漢" }));
     });
     await expect(noteBox).toHaveValue("漢");
     await toggleWarningBtn.evaluate((el) => el.click());
-    await overlay.getByRole("button", { name: "Clear note" }).evaluate((el) =>
-      el.click()
-    );
+    await overlay.getByRole("button", { name: "Clear note" }).evaluate((el) => el.click());
     await expect(noteBox).toHaveValue("");
 
     // 6. Multiline <textarea>, placeholder, selection sync, read-only input, and ScrollIntoView
@@ -232,10 +219,7 @@ test.describe("egui-web-accesskit E2E", () => {
       el.dispatchEvent(new Event("select"));
     });
     await page.waitForTimeout(150);
-    const selRange = await bioBox.evaluate((el) => [
-      el.selectionStart,
-      el.selectionEnd,
-    ]);
+    const selRange = await bioBox.evaluate((el) => [el.selectionStart, el.selectionEnd]);
     expect(selRange).toEqual([0, 6]);
 
     const tokenBox = overlay.getByLabel("Token:");
@@ -328,9 +312,7 @@ test.describe("egui-web-accesskit E2E", () => {
     const boxBefore = await incBtn.boundingBox();
     expect(boxBefore).not.toBeNull();
 
-    await overlay.getByRole("button", { name: "Zoom 1.5x" }).evaluate((el) =>
-      el.click()
-    );
+    await overlay.getByRole("button", { name: "Zoom 1.5x" }).evaluate((el) => el.click());
 
     await expect
       .poll(async () => {
@@ -341,14 +323,9 @@ test.describe("egui-web-accesskit E2E", () => {
 
     const boxAfter = await incBtn.boundingBox();
     expect(boxAfter).not.toBeNull();
-    await page.mouse.click(
-      boxAfter.x + boxAfter.width / 2,
-      boxAfter.y + boxAfter.height / 2
-    );
+    await page.mouse.click(boxAfter.x + boxAfter.width / 2, boxAfter.y + boxAfter.height / 2);
     await expect(overlay.getByText("Button clicked 2 times")).toBeAttached();
-    const activeInsideOverlay = await overlay.evaluate((el) =>
-      el.contains(document.activeElement)
-    );
+    const activeInsideOverlay = await overlay.evaluate((el) => el.contains(document.activeElement));
     expect(activeInsideOverlay).toBe(false);
 
     expect(errors).toEqual([]);
@@ -412,7 +389,9 @@ test.describe("egui-web-accesskit E2E", () => {
     await noteBox.focus();
     await page.evaluate(() => {
       window.__inputAttrMutations = [];
-      const input = document.querySelector('[data-egui-accesskit="true"] input[aria-label="Note:"]');
+      const input = document.querySelector(
+        '[data-egui-accesskit="true"] input[aria-label="Note:"]'
+      );
       window.__noteInput = input;
       const observer = new MutationObserver((records) => {
         for (const record of records) {
@@ -481,9 +460,7 @@ test.describe("egui-web-accesskit E2E", () => {
     expect(errors).toEqual([]);
   });
 
-  test("aria-autocomplete is mirrored only when the application sets it", async ({
-    page,
-  }) => {
+  test("aria-autocomplete is mirrored only when the application sets it", async ({ page }) => {
     await page.goto("/");
     const overlay = page.locator('[data-egui-accesskit="true"]');
     await expect(overlay).toBeAttached({ timeout: 15000 });
@@ -498,9 +475,7 @@ test.describe("egui-web-accesskit E2E", () => {
     ).toBe(false);
   });
 
-  test("supports Shadow DOM via WebAccessKitPlugin::from_canvas", async ({
-    page,
-  }) => {
+  test("supports Shadow DOM via WebAccessKitPlugin::from_canvas", async ({ page }) => {
     const errors = [];
     page.on("pageerror", (err) => errors.push(err.message));
 
@@ -527,9 +502,7 @@ test.describe("egui-web-accesskit E2E", () => {
     await shadowOverlay
       .getByRole("button", { name: "Increment counter" })
       .evaluate((el) => el.click());
-    await expect(
-      shadowOverlay.getByText("Button clicked 1 times")
-    ).toBeAttached();
+    await expect(shadowOverlay.getByText("Button clicked 1 times")).toBeAttached();
 
     const noteBox = shadowOverlay.getByRole("textbox", { name: "Note:" });
     await noteBox.evaluate((el) => {
@@ -547,9 +520,7 @@ test.describe("egui-web-accesskit E2E", () => {
     expect(errors).toEqual([]);
   });
 
-  test("supports lazy activation via WebAccessKitPlugin::new_lazy", async ({
-    page,
-  }) => {
+  test("supports lazy activation via WebAccessKitPlugin::new_lazy", async ({ page }) => {
     const errors = [];
     page.on("pageerror", (err) => errors.push(err.message));
 
@@ -558,9 +529,7 @@ test.describe("egui-web-accesskit E2E", () => {
     const overlay = page.locator('[data-egui-accesskit="true"]');
     const activateBtn = overlay.locator("[data-egui-accesskit-activate]");
     await expect(activateBtn).toBeAttached({ timeout: 15000 });
-    await expect(
-      overlay.getByRole("button", { name: "Increment counter" })
-    ).toHaveCount(0);
+    await expect(overlay.getByRole("button", { name: "Increment counter" })).toHaveCount(0);
 
     await activateBtn.evaluate((el) => el.click());
     await expect(activateBtn).toHaveCount(0);
