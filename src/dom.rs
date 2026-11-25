@@ -109,16 +109,6 @@ pub(crate) fn try_with_bridge_mut<R>(id: u64, f: impl FnOnce(&mut WebDomBridge) 
     })
 }
 
-fn try_with_bridge_mut_status<R>(
-    id: u64,
-    f: impl FnOnce(&mut WebDomBridge) -> R,
-) -> Result<Option<R>, std::cell::BorrowMutError> {
-    BRIDGES.with(|bridges| {
-        let mut map = bridges.try_borrow_mut()?;
-        Ok(map.get_mut(&id).map(f))
-    })
-}
-
 pub(crate) fn activate_bridge(id: u64) {
     activate_bridge_inner(id, false);
 }
@@ -154,19 +144,7 @@ pub(crate) fn drain_pending_events(
         pending.drain(..).collect::<Vec<_>>()
     };
 
-    let deferred = match try_with_bridge_mut_status(id, |bridge| {
-        let drained = {
-            let mut pending = queue
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-            if pending.is_empty() {
-                return Vec::new();
-            }
-
-            pending.drain(..).collect::<Vec<_>>()
-        };
-
+    let deferred = with_bridge_mut(id, |bridge| {
         bridge.dom_action_in_flight = true;
         let current_focus = bridge.tree.focused_id();
         let mut focus_requested = HashSet::new();
@@ -295,16 +273,8 @@ pub(crate) fn drain_pending_events(
             bridge.deferred_focus_target = None;
         }
         deferred
-    }) {
-        Err(_) => {
-            // The bridge is busy. The queue was not drained, so the events can be
-            // processed on the next frame.
-            ctx.request_repaint();
-            return;
-        }
-        Ok(None) => return,
-        Ok(Some(deferred)) => deferred,
-    };
+    })
+    .unwrap_or_default();
 
     if !deferred.is_empty() {
         if let Ok(mut pending) = queue.lock() {
@@ -847,8 +817,7 @@ impl WebDomBridge {
                 };
                 let text_info = try_with_bridge_mut(id, |bridge| {
                     let spec = bridge.tree.spec(node_id)?;
-                    if InteractionKind::from_spec(spec) == InteractionKind::Text
-                        && !spec.read_only
+                    if InteractionKind::from_spec(spec) == InteractionKind::Text && !spec.read_only
                     {
                         Some((
                             spec.input_type == Some("password"),
