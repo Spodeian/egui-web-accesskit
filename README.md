@@ -36,7 +36,7 @@ For canvases hosted inside a `ShadowRoot` on `wasm32`, construct with `WebAccess
 To defer AccessKit tree building until a screen reader user activates the lightweight toggle control (or until you call `WebAccessKitPlugin::activate(&ctx)`), use `WebAccessKitPlugin::new_lazy("the_canvas_id")` or `WebAccessKitConfig::new("the_canvas_id").with_lazy(true)`.
 When unmounting an `egui::Context` outside `eframe::WebRunner::destroy` (or on `egui 0.35`/`0.36`, which do not have `Plugin::on_exit`), call `WebAccessKitPlugin::teardown(&ctx)` to remove the DOM overlay and break the repaint-wakeup reference cycle.
 
-On non-`wasm32` targets the plugin is a clean no-op so native builds can keep using `eframe` / `egui-winit`'s built-in desktop AccessKit adapters without `#[cfg]` clutter at the call site.
+This crate is intended only for `wasm32` deployment. On non-`wasm32` targets the plugin compiles to a clean no-op purely so shared code and native builds keep compiling without `#[cfg]` clutter at the call site; it does nothing there, so desktop apps should keep using `eframe` / `egui-winit`'s built-in AccessKit adapters.
 
 ## How It Works
 
@@ -87,7 +87,7 @@ ui.ctx().accesskit_node_builder(docs.id, |node| {
 
 ## Running Tests & Demo
 
-Run unit tests, doctests, Clippy, and rustdoc natively and for WASM:
+Native `cargo test` covers the platform-independent mapper (the DOM bridge only exists on `wasm32`). Run the checks natively and for WASM:
 
 ```sh
 cargo test
@@ -96,7 +96,7 @@ cargo clippy --target wasm32-unknown-unknown -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --target wasm32-unknown-unknown
 ```
 
-See [examples/demo/README.md](examples/demo/README.md) to run the interactive `eframe` demo in the browser or natively, and [e2e/README.md](e2e/README.md) to run the Playwright + axe-core browser suite.
+See [examples/demo/README.md](examples/demo/README.md) to run the interactive `eframe` demo in the browser (it is browser-only), and [e2e/README.md](e2e/README.md) to run the Playwright + axe-core browser suite, which verifies the DOM bridge.
 
 ## Known Limitations
 

@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
-[dependencies]
+# This demo is deployed to the browser only. The egui and bridge dependencies are therefore
+# restricted to wasm32, so a native build compiles to a stub that explains how to run it.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
 eframe = { version = "0.37.0", default-features = false, features = [
     "accesskit",
     "default_fonts",
@@ -14,8 +16,6 @@ eframe = { version = "0.37.0", default-features = false, features = [
 ] }
 egui = "0.37.0"
 egui-web-accesskit = { path = "../.." }
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [

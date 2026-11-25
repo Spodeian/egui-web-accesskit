@@ -1,18 +1,23 @@
+#[cfg(target_arch = "wasm32")]
 use eframe::egui;
+#[cfg(target_arch = "wasm32")]
 use egui_web_accesskit::WebAccessKitPlugin;
 
+#[cfg(target_arch = "wasm32")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Density {
     Compact,
     Spacious,
 }
 
+#[cfg(target_arch = "wasm32")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DemoTheme {
     Dark,
     Light,
 }
 
+#[cfg(target_arch = "wasm32")]
 impl DemoTheme {
     fn as_str(self) -> &'static str {
         match self {
@@ -22,11 +27,13 @@ impl DemoTheme {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 fn scoped_row(ui: &mut egui::Ui, salt: &'static str, add_contents: impl FnOnce(&mut egui::Ui)) {
     let row_id = ui.make_persistent_id(salt);
     ui.scope_builder(egui::UiBuilder::new().scope_id(row_id), add_contents);
 }
 
+#[cfg(target_arch = "wasm32")]
 struct DemoApp {
     clicks: u32,
     accepted: bool,
@@ -47,8 +54,14 @@ struct DemoApp {
     progress: f32,
     theme: DemoTheme,
     show_modal: bool,
+    dialog_dismissals: u32,
+    dialog_confirmed: bool,
+    /// Frames left before `WebAccessKitPlugin::teardown` runs (set by `?teardown=1`).
+    teardown_frames: Option<u32>,
+    torn_down: bool,
 }
 
+#[cfg(target_arch = "wasm32")]
 impl Default for DemoApp {
     fn default() -> Self {
         Self {
@@ -71,12 +84,27 @@ impl Default for DemoApp {
             progress: 0.75,
             theme: DemoTheme::Dark,
             show_modal: false,
+            dialog_dismissals: 0,
+            dialog_confirmed: false,
+            teardown_frames: None,
+            torn_down: false,
         }
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 impl eframe::App for DemoApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if let Some(frames) = self.teardown_frames {
+            if frames == 0 {
+                WebAccessKitPlugin::teardown(ui.ctx());
+                self.teardown_frames = None;
+                self.torn_down = true;
+            } else {
+                self.teardown_frames = Some(frames - 1);
+                ui.ctx().request_repaint();
+            }
+        }
         egui::CentralPanel::default().show(ui, |ui| {
             let heading = ui.heading("egui-web-accesskit demo");
             ui.ctx().accesskit_node_builder(heading.id, |node| {
@@ -272,6 +300,17 @@ impl eframe::App for DemoApp {
                 if cols[1].button("Open dialog").clicked() {
                     self.show_modal = true;
                 }
+                let dialog_result = if self.dialog_confirmed {
+                    "confirmed"
+                } else if self.dialog_dismissals > 0 {
+                    "dismissed"
+                } else {
+                    "not yet answered"
+                };
+                cols[1].label(format!("Last dialog result: {dialog_result}"));
+                if self.torn_down {
+                    cols[1].label("Accessibility mirror: torn down");
+                }
             });
 
             if self.show_modal {
@@ -287,9 +326,19 @@ impl eframe::App for DemoApp {
                         node.set_modal();
                     });
                     ui.label("Confirm action?");
-                    if ui.button("Close dialog").clicked() {
-                        self.show_modal = false;
-                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Close dialog").clicked() {
+                            self.show_modal = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.show_modal = false;
+                            self.dialog_dismissals += 1;
+                        }
+                        if ui.button("Confirm action").clicked() {
+                            self.show_modal = false;
+                            self.dialog_confirmed = true;
+                        }
+                    });
                 });
             }
         });
@@ -297,17 +346,12 @@ impl eframe::App for DemoApp {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn main() -> eframe::Result<()> {
-    let options = eframe::NativeOptions::default();
-    eframe::run_native(
-        "egui-web-accesskit demo",
-        options,
-        Box::new(|cc| {
-            cc.egui_ctx
-                .add_plugin(WebAccessKitPlugin::new("the_canvas_id"));
-            Ok(Box::new(DemoApp::default()))
-        }),
-    )
+fn main() {
+    eprintln!(
+        "egui-web-accesskit-demo is browser-only (wasm32-unknown-unknown). \
+         Run it with `trunk serve` or build it with `trunk build` in examples/demo."
+    );
+    std::process::exit(1);
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -326,6 +370,7 @@ fn main() {
         let search = window.location().search().unwrap_or_default();
         let shadow_mode = search.contains("shadow=1");
         let lazy_mode = search.contains("lazy=1");
+        let teardown_mode = search.contains("teardown=1");
 
         let plugin = if shadow_mode {
             canvas.remove();
@@ -358,7 +403,11 @@ fn main() {
                 web_options,
                 Box::new(move |cc| {
                     cc.egui_ctx.add_plugin(plugin);
-                    Ok(Box::new(DemoApp::default()))
+                    let mut app = DemoApp::default();
+                    if teardown_mode {
+                        app.teardown_frames = Some(3);
+                    }
+                    Ok(Box::new(app))
                 }),
             )
             .await

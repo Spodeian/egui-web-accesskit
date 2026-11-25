@@ -54,4 +54,11 @@ npx playwright test --project=chrome --headed
 - Password masking safety (no plaintext in the DOM) and `ReplaceSelectedText` / `SetValue` edits.
 - `ScrollArea` `PageDown` / `PageUp` scroll actions and `ScrollIntoView` on DOM focus, idle outer-page scroll/offset realignment, and `devicePixelRatio` zoom alignment against real `<canvas>` pointer clicks.
 - Shadow DOM hosting via `WebAccessKitPlugin::from_canvas` (`/?shadow=1`), including `shadowRoot.activeElement` focus retention.
-- Deferred AccessKit activation via `WebAccessKitPlugin::new_lazy` (`/?lazy=1`).
+- Deferred AccessKit activation via `WebAccessKitPlugin::new_lazy` (`/?lazy=1`), including focus restoration when the activation button is focused and removed.
+- Real pointer clicks through the transparent overlay (`Increment counter`, `Enable notifications`), and keyboard `Space` on checkboxes and comboboxes.
+- Dialog focus: keyboard Enter/Space opens it with focus inside, Tab/Shift+Tab wrap across all three dialog controls, Escape restores focus to the opener, Cancel/Confirm results reach the app, and a pointer-opened dialog leaves DOM focus on the canvas.
+- Mirror geometry after a viewport resize (overlay matches the canvas rectangle).
+- `WebAccessKitPlugin::teardown` (`/?teardown=1`): the mirror is removed and not re-mounted, with no errors.
+- Every test fails on any `pageerror` or `console.error`, so wasm panics and logged errors can't pass silently.
+
+The suite is browser-only, matching the crate: it runs against the wasm build of the demo, and the native build of the crate is covered by `cargo test` (mapper unit tests and the no-op plugin test).
