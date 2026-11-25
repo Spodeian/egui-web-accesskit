@@ -35,6 +35,7 @@ struct DemoApp {
     opacity: f64,
     volume: f64,
     note: String,
+    note_submitted: u32,
     force_warning: bool,
     bio: String,
     secret: String,
@@ -57,6 +58,7 @@ impl Default for DemoApp {
             opacity: 0.35,
             volume: 50.0,
             note: String::from("Type here"),
+            note_submitted: 0,
             force_warning: false,
             bio: String::from("Line 1"),
             secret: String::from("s3cr3t"),
@@ -140,8 +142,13 @@ impl eframe::App for DemoApp {
                     ui.horizontal(|ui| {
                         let label = ui.label("Note:");
                         let note_id = ui.make_persistent_id("note_edit");
-                        ui.add(egui::TextEdit::singleline(&mut self.note).id(note_id))
+                        let note_resp = ui
+                            .add(egui::TextEdit::singleline(&mut self.note).id(note_id))
                             .labelled_by(label.id);
+                        if note_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                        {
+                            self.note_submitted += 1;
+                        }
                         if ui.button("Clear note").clicked() {
                             self.note.clear();
                         }
@@ -150,6 +157,7 @@ impl eframe::App for DemoApp {
                         }
                     });
                 });
+                cols[0].label(format!("Note submits: {}", self.note_submitted));
 
                 egui::CollapsingHeader::new("Advanced details").show(&mut cols[0], |ui| {
                     ui.label("Hidden detail text");
@@ -248,6 +256,9 @@ impl eframe::App for DemoApp {
             if self.show_modal {
                 let modal_id = ui.make_persistent_id("confirm_modal");
                 egui::Modal::new(modal_id).show(ui.ctx(), |ui| {
+                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        self.show_modal = false;
+                    }
                     let dialog_id = ui.response().id;
                     ui.ctx().accesskit_node_builder(dialog_id, |node| {
                         node.set_role(egui::accesskit::Role::AlertDialog);
@@ -291,11 +302,9 @@ fn main() {
             .dyn_into::<web_sys::HtmlCanvasElement>()
             .expect("#the_canvas_id is not an HtmlCanvasElement");
 
-        let shadow_mode = window
-            .location()
-            .search()
-            .ok()
-            .is_some_and(|s| s.contains("shadow=1"));
+        let search = window.location().search().unwrap_or_default();
+        let shadow_mode = search.contains("shadow=1");
+        let lazy_mode = search.contains("lazy=1");
 
         let plugin = if shadow_mode {
             canvas.remove();
@@ -317,6 +326,8 @@ fn main() {
                 .append_child(&canvas)
                 .expect("append canvas to shadow root");
             WebAccessKitPlugin::from_canvas(canvas.clone())
+        } else if lazy_mode {
+            WebAccessKitPlugin::new_lazy("the_canvas_id")
         } else {
             WebAccessKitPlugin::new("the_canvas_id")
         };

@@ -143,6 +143,13 @@ test.describe("egui-web-accesskit E2E", () => {
     await expect(modal).toHaveCount(0);
     expect(await incBtn.evaluate((el) => el.closest("[inert]") !== null)).toBe(false);
 
+    await overlay.getByRole("button", { name: "Open dialog" }).evaluate((el) => el.click());
+    await expect(modal).toBeAttached();
+    await overlay.getByRole("button", { name: "Close dialog" }).focus();
+    await page.keyboard.press("Escape");
+    await expect(modal).toHaveCount(0);
+    expect(await incBtn.evaluate((el) => el.closest("[inert]") !== null)).toBe(false);
+
     // 3. Disclosure click & aria-expanded update
     await detailsBtn.evaluate((el) => el.click());
     await expect(detailsBtn).toHaveAttribute("aria-expanded", "true");
@@ -167,6 +174,9 @@ test.describe("egui-web-accesskit E2E", () => {
       (el) => el === document.activeElement
     );
     expect(stillFocused).toBe(true);
+
+    await page.keyboard.press("Enter");
+    await expect(overlay.getByText("Note submits: 1")).toBeAttached();
 
     await overlay.getByRole("button", { name: "Clear note" }).evaluate((el) =>
       el.click()
@@ -389,6 +399,32 @@ test.describe("egui-web-accesskit E2E", () => {
       return host?.shadowRoot?.activeElement === el;
     });
     expect(activeInShadow).toBe(true);
+
+    expect(errors).toEqual([]);
+  });
+
+  test("supports lazy activation via WebAccessKitPlugin::new_lazy", async ({
+    page,
+  }) => {
+    const errors = [];
+    page.on("pageerror", (err) => errors.push(err.message));
+
+    await page.goto("/?lazy=1");
+
+    const overlay = page.locator('[data-egui-accesskit="true"]');
+    const activateBtn = overlay.locator("[data-egui-accesskit-activate]");
+    await expect(activateBtn).toBeAttached({ timeout: 15000 });
+    await expect(
+      overlay.getByRole("button", { name: "Increment counter" })
+    ).toHaveCount(0);
+
+    await activateBtn.evaluate((el) => el.click());
+    await expect(activateBtn).toHaveCount(0);
+
+    const incBtn = overlay.getByRole("button", { name: "Increment counter" });
+    await expect(incBtn).toBeAttached({ timeout: 15000 });
+    await incBtn.evaluate((el) => el.click());
+    await expect(overlay.getByText("Button clicked 1 times")).toBeAttached();
 
     expect(errors).toEqual([]);
   });
