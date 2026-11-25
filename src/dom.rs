@@ -412,6 +412,8 @@ pub(crate) struct WebDomBridge {
     modal_dirty: bool,
     /// Node that held DOM focus when a keyboard-driven modal opened; focus returns here on close.
     modal_return_focus: Option<NodeId>,
+    /// Set while focus should move into a newly opened modal once one of its controls is mirrored.
+    modal_focus_pending: bool,
     inert_elements: Vec<Element>,
     queue: ActionQueue,
     repaint_wakeup: RepaintWakeup,
@@ -536,6 +538,7 @@ impl WebDomBridge {
             modal_nodes: HashSet::new(),
             modal_dirty: false,
             modal_return_focus: None,
+            modal_focus_pending: false,
             inert_elements: Vec::new(),
             queue,
             repaint_wakeup: Rc::new(RefCell::new(Some(wakeup))),
@@ -1107,10 +1110,12 @@ impl WebDomBridge {
         // to the opener when it closes (WAI-ARIA dialog pattern).
         let has_modal = !self.modal_nodes.is_empty();
         if !had_modal && has_modal {
-            self.focus_modal_on_open(prev_focused_id);
+            self.begin_modal_focus(prev_focused_id);
         } else if had_modal && !has_modal {
+            self.modal_focus_pending = false;
             self.restore_focus_after_modal();
         }
+        self.settle_modal_focus();
 
         if scale_changed {
             self.reapply_all_bounds(scale);
@@ -1118,28 +1123,44 @@ impl WebDomBridge {
         self.dom_action_in_flight = false;
     }
 
-    /// Moves focus into the top modal after it opens from a DOM-driven action (keyboard or a
-    /// focused control). Pointer-opened modals leave focus on the `<canvas>`.
-    fn focus_modal_on_open(&mut self, opener: Option<NodeId>) {
+    /// Records that a modal opened from a DOM-driven action (keyboard or a focused control), so
+    /// focus should move into it. Pointer-opened modals leave focus on the `<canvas>`.
+    fn begin_modal_focus(&mut self, opener: Option<NodeId>) {
         if opener.is_none() && !self.dom_action_in_flight {
             return;
         }
-        let Some(modal_el) = self.find_top_modal_element() else {
-            return;
-        };
-        if active_element_for(self.container.as_ref(), &self.document)
-            .is_some_and(|active| modal_el.contains(Some(active.as_ref())))
-        {
+        self.modal_return_focus = opener;
+        self.modal_focus_pending = true;
+    }
+
+    /// Completes a pending modal focus move. A dialog's controls can be mirrored in a later
+    /// update than the dialog itself, so until one of them takes focus the dialog element is
+    /// focused as a placeholder and the move is retried on each update.
+    fn settle_modal_focus(&mut self) {
+        if !self.modal_focus_pending {
             return;
         }
-        let target = first_focusable_within(&modal_el).unwrap_or_else(|| {
+        let Some(modal_el) = self.find_top_modal_element() else {
+            self.modal_focus_pending = false;
+            return;
+        };
+        let active = active_element_for(self.container.as_ref(), &self.document);
+        if active
+            .as_ref()
+            .is_some_and(|a| *a != modal_el && modal_el.contains(Some(a.as_ref())))
+        {
+            self.modal_focus_pending = false;
+            return;
+        }
+        if let Some(target) = first_focusable_within(&modal_el) {
+            self.modal_focus_pending = false;
+            self.focus_element(&target);
+            if let Some(id) = parse_node_id(&target) {
+                push_action(&self.queue, &self.repaint_wakeup, focus_action(id));
+            }
+        } else {
             let _ = modal_el.set_attribute("tabindex", "-1");
-            modal_el.clone()
-        });
-        self.modal_return_focus = opener;
-        self.focus_element(&target);
-        if let Some(id) = parse_node_id(&target) {
-            push_action(&self.queue, &self.repaint_wakeup, focus_action(id));
+            self.focus_element(&modal_el);
         }
     }
 
