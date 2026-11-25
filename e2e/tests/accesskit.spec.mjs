@@ -7,6 +7,9 @@ test.describe("egui-web-accesskit E2E", () => {
   }) => {
     const errors = [];
     page.on("pageerror", (err) => errors.push(err.message));
+    page.on("console", (msg) => {
+      if (msg.type() === "error") errors.push(msg.text());
+    });
 
     await page.goto("/");
 
@@ -336,6 +339,9 @@ test.describe("egui-web-accesskit E2E", () => {
   }) => {
     const errors = [];
     page.on("pageerror", (err) => errors.push(err.message));
+    page.on("console", (msg) => {
+      if (msg.type() === "error") errors.push(msg.text());
+    });
 
     await page.goto("/");
     const overlay = page.locator('[data-egui-accesskit="true"]');
@@ -377,6 +383,9 @@ test.describe("egui-web-accesskit E2E", () => {
   }) => {
     const errors = [];
     page.on("pageerror", (err) => errors.push(err.message));
+    page.on("console", (msg) => {
+      if (msg.type() === "error") errors.push(msg.text());
+    });
 
     await page.goto("/");
     const overlay = page.locator('[data-egui-accesskit="true"]');
@@ -432,6 +441,9 @@ test.describe("egui-web-accesskit E2E", () => {
   }) => {
     const errors = [];
     page.on("pageerror", (err) => errors.push(err.message));
+    page.on("console", (msg) => {
+      if (msg.type() === "error") errors.push(msg.text());
+    });
 
     await page.goto("/");
     const overlay = page.locator('[data-egui-accesskit="true"]');
@@ -478,6 +490,9 @@ test.describe("egui-web-accesskit E2E", () => {
   test("supports Shadow DOM via WebAccessKitPlugin::from_canvas", async ({ page }) => {
     const errors = [];
     page.on("pageerror", (err) => errors.push(err.message));
+    page.on("console", (msg) => {
+      if (msg.type() === "error") errors.push(msg.text());
+    });
 
     await page.goto("/?shadow=1");
 
@@ -525,6 +540,9 @@ test.describe("egui-web-accesskit E2E", () => {
   }) => {
     const errors = [];
     page.on("pageerror", (err) => errors.push(err.message));
+    page.on("console", (msg) => {
+      if (msg.type() === "error") errors.push(msg.text());
+    });
 
     await page.goto("/?lazy=1");
     const overlay = page.locator('[data-egui-accesskit="true"]');
@@ -552,6 +570,9 @@ test.describe("egui-web-accesskit E2E", () => {
   test("supports lazy activation via WebAccessKitPlugin::new_lazy", async ({ page }) => {
     const errors = [];
     page.on("pageerror", (err) => errors.push(err.message));
+    page.on("console", (msg) => {
+      if (msg.type() === "error") errors.push(msg.text());
+    });
 
     await page.goto("/?lazy=1");
 
