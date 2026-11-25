@@ -7,8 +7,8 @@ use std::collections::HashMap;
 
 use accesskit_consumer::{FilterResult, Node, Tree, TreeChangeHandler};
 use egui::accesskit::{
-    Action, ActionData, ActionRequest, Live, NodeId, Rect, Role, TextSelection, Toggled, TreeId,
-    TreeUpdate,
+    Action, ActionData, ActionRequest, Invalid, Live, NodeId, Orientation, Rect, Role,
+    TextSelection, Toggled, TreeId, TreeUpdate,
 };
 use egui::{Event, Key, Modifiers};
 
@@ -106,6 +106,30 @@ pub struct DomNodeSpec {
     pub text_selection: Option<(usize, usize)>,
     /// Node bounding box in physical `egui` pixels (`bounds / devicePixelRatio` in CSS px).
     pub bounds: Option<Rect>,
+    /// Whether input is required (`aria-required`).
+    pub required: bool,
+    /// Validation error state (`aria-invalid`).
+    pub invalid: Option<Invalid>,
+    /// Validation error message node ID (`aria-errormessage`).
+    pub error_message: Option<NodeId>,
+    /// Referenced description node IDs (`aria-describedby`).
+    pub described_by: Vec<NodeId>,
+    /// Active descendant node ID (`aria-activedescendant`).
+    pub active_descendant: Option<NodeId>,
+    /// Control or container orientation (`aria-orientation`).
+    pub orientation: Option<Orientation>,
+    /// 0-based position within a set (`aria-posinset` emits `+ 1`).
+    pub position_in_set: Option<usize>,
+    /// Total items in a set (`aria-setsize`).
+    pub size_of_set: Option<usize>,
+    /// Total rows in a table or grid (`aria-rowcount`).
+    pub row_count: Option<usize>,
+    /// Total columns in a table or grid (`aria-colcount`).
+    pub column_count: Option<usize>,
+    /// 0-based row index (`aria-rowindex` emits `+ 1`).
+    pub row_index: Option<usize>,
+    /// 0-based column index (`aria-colindex` emits `+ 1`).
+    pub column_index: Option<usize>,
 }
 
 /// Incremental DOM mutation produced by [`TreeBridge::apply_update`].
@@ -267,6 +291,7 @@ pub fn map_node(node: &Node<'_>) -> DomNodeSpec {
         None
     };
 
+    let data = node.data();
     DomNodeSpec {
         id: node.locate().0,
         tag,
@@ -278,14 +303,14 @@ pub fn map_node(node: &Node<'_>) -> DomNodeSpec {
         placeholder,
         url,
         toggled: node.toggled(),
-        expanded: node.data().is_expanded(),
+        expanded: data.is_expanded(),
         clickable: node.is_clickable(&|_| FilterResult::Include),
         disabled: node.is_disabled(),
-        read_only: node.data().is_read_only(),
+        read_only: data.is_read_only(),
         focusable: node.is_focusable(&|_| FilterResult::Include),
         heading_level: node.level(),
         modal: node.is_modal(),
-        live: node.data().live().filter(|l| *l != Live::Off),
+        live: data.live().filter(|l| *l != Live::Off),
         numeric_value: node.numeric_value(),
         numeric_min: node.min_numeric_value(),
         numeric_max: node.max_numeric_value(),
@@ -294,6 +319,18 @@ pub fn map_node(node: &Node<'_>) -> DomNodeSpec {
         bounds: (!node.is_hidden())
             .then(|| node.bounding_box())
             .flatten(),
+        required: data.is_required(),
+        invalid: data.invalid(),
+        error_message: data.error_message(),
+        described_by: data.described_by().to_vec(),
+        active_descendant: data.active_descendant(),
+        orientation: data.orientation(),
+        position_in_set: data.position_in_set(),
+        size_of_set: data.size_of_set(),
+        row_count: data.row_count(),
+        column_count: data.column_count(),
+        row_index: data.row_index(),
+        column_index: data.column_index(),
     }
 }
 
@@ -309,17 +346,9 @@ fn has_any_ancestor(node: &Node<'_>, targets: &[Role]) -> bool {
 }
 
 fn has_descendant(node: &Node<'_>, pred: &impl Fn(&Node<'_>) -> bool) -> bool {
-    let mut stack: Vec<_> = node.children().collect();
-    while let Some(child) = stack.pop() {
-        if should_skip_node(&child) {
-            continue;
-        }
-        if pred(&child) {
-            return true;
-        }
-        stack.extend(child.children());
-    }
-    false
+    node.children().any(|child| {
+        !should_skip_node(&child) && (pred(&child) || has_descendant(&child, pred))
+    })
 }
 
 fn map_role(role: Role) -> (DomTag, Option<&'static str>, Option<&'static str>) {
@@ -405,18 +434,12 @@ fn collect_dom_children(node: &Node<'_>) -> Vec<NodeId> {
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-#[allow(clippy::large_enum_variant)]
-pub(crate) enum BridgeOp {
-    Upsert {
-        old: Option<DomNodeSpec>,
-        spec: DomNodeSpec,
-    },
-    SetChildren {
-        parent: NodeId,
-        children: Vec<NodeId>,
-    },
-    Remove(NodeId),
-    SetFocus(Option<NodeId>),
+#[derive(Default)]
+pub(crate) struct TreeDelta {
+    pub upserts: Vec<(Option<DomNodeSpec>, DomNodeSpec)>,
+    pub children_ops: Vec<(NodeId, Vec<NodeId>)>,
+    pub removals: Vec<NodeId>,
+    pub focus_change: Option<Option<NodeId>>,
 }
 
 /// Retains an `accesskit_consumer::Tree` across frames and translates updates into [`DomOp`]s.
@@ -455,27 +478,37 @@ impl TreeBridge {
 
     /// Applies an AccessKit [`TreeUpdate`] and returns ordered DOM mutations.
     pub fn apply_update(&mut self, update: TreeUpdate) -> Vec<DomOp> {
-        self.apply_update_diff(update)
-            .into_iter()
-            .map(|op| match op {
-                BridgeOp::Upsert { spec, .. } => DomOp::Upsert(spec),
-                BridgeOp::SetChildren { parent, children } => DomOp::SetChildren { parent, children },
-                BridgeOp::Remove(id) => DomOp::Remove(id),
-                BridgeOp::SetFocus(target) => DomOp::SetFocus(target),
-            })
-            .collect()
+        let delta = self.apply_update_diff(update);
+        let mut ops = Vec::with_capacity(
+            delta.upserts.len()
+                + delta.children_ops.len()
+                + delta.removals.len()
+                + usize::from(delta.focus_change.is_some()),
+        );
+        ops.extend(delta.upserts.into_iter().map(|(_, spec)| DomOp::Upsert(spec)));
+        ops.extend(
+            delta
+                .children_ops
+                .into_iter()
+                .map(|(parent, children)| DomOp::SetChildren { parent, children }),
+        );
+        ops.extend(delta.removals.into_iter().map(DomOp::Remove));
+        if let Some(target) = delta.focus_change {
+            ops.push(DomOp::SetFocus(target));
+        }
+        ops
     }
 
-    pub(crate) fn apply_update_diff(&mut self, update: TreeUpdate) -> Vec<BridgeOp> {
+    pub(crate) fn apply_update_diff(&mut self, update: TreeUpdate) -> TreeDelta {
         if let Some(tree) = self.tree.as_mut() {
             let mut collector = DeltaCollector::new(&mut self.specs);
             tree.update_and_process_changes(update, &mut collector);
-            collector.into_ops()
+            collector.delta
         } else {
             let tree = Tree::new(update, true);
-            let ops = collect_initial_ops(&tree, &mut self.specs);
+            let delta = collect_initial_delta(&tree, &mut self.specs);
             self.tree = Some(tree);
-            ops
+            delta
         }
     }
 
@@ -575,11 +608,10 @@ impl TreeBridge {
     }
 }
 
-fn collect_initial_ops(tree: &Tree, specs: &mut HashMap<NodeId, DomNodeSpec>) -> Vec<BridgeOp> {
+fn collect_initial_delta(tree: &Tree, specs: &mut HashMap<NodeId, DomNodeSpec>) -> TreeDelta {
     let state = tree.state();
     specs.clear();
-    let mut upserts = Vec::new();
-    let mut children_ops = Vec::new();
+    let mut delta = TreeDelta::default();
     let mut stack = vec![state.root()];
 
     while let Some(node) = stack.pop() {
@@ -588,65 +620,33 @@ fn collect_initial_ops(tree: &Tree, specs: &mut HashMap<NodeId, DomNodeSpec>) ->
         }
         let spec = map_node(&node);
         specs.insert(spec.id, spec.clone());
-        upserts.push(BridgeOp::Upsert { old: None, spec });
+        delta.upserts.push((None, spec));
         let child_ids = collect_dom_children(&node);
         if !child_ids.is_empty() {
-            children_ops.push(BridgeOp::SetChildren {
-                parent: node.locate().0,
-                children: child_ids,
-            });
+            delta.children_ops.push((node.locate().0, child_ids));
         }
         for child in node.children().rev() {
             stack.push(child);
         }
     }
 
-    let mut ops = Vec::with_capacity(upserts.len() + children_ops.len() + 1);
-    ops.extend(upserts);
-    ops.extend(children_ops);
     if let Some(focus) = state.focus().filter(|n| !should_skip_node(n)) {
-        ops.push(BridgeOp::SetFocus(Some(focus.locate().0)));
+        delta.focus_change = Some(Some(focus.locate().0));
     }
-    ops
+    delta
 }
 
 struct DeltaCollector<'a> {
     specs: &'a mut HashMap<NodeId, DomNodeSpec>,
-    upserts: Vec<(Option<DomNodeSpec>, DomNodeSpec)>,
-    children_ops: Vec<BridgeOp>,
-    removals: Vec<NodeId>,
-    focus_change: Option<Option<NodeId>>,
+    delta: TreeDelta,
 }
 
 impl<'a> DeltaCollector<'a> {
     fn new(specs: &'a mut HashMap<NodeId, DomNodeSpec>) -> Self {
         Self {
             specs,
-            upserts: Vec::new(),
-            children_ops: Vec::new(),
-            removals: Vec::new(),
-            focus_change: None,
+            delta: TreeDelta::default(),
         }
-    }
-
-    fn into_ops(self) -> Vec<BridgeOp> {
-        let focus_len = usize::from(self.focus_change.is_some());
-        let mut ops = Vec::with_capacity(
-            self.upserts.len() + self.children_ops.len() + self.removals.len() + focus_len,
-        );
-        // Upsert new/changed nodes before wiring parent-child links, detach before
-        // removing nodes, and apply focus only after the target is attached.
-        ops.extend(
-            self.upserts
-                .into_iter()
-                .map(|(old, spec)| BridgeOp::Upsert { old, spec }),
-        );
-        ops.extend(self.children_ops);
-        ops.extend(self.removals.into_iter().map(BridgeOp::Remove));
-        if let Some(focus) = self.focus_change {
-            ops.push(BridgeOp::SetFocus(focus));
-        }
-        ops
     }
 }
 
@@ -657,13 +657,10 @@ impl TreeChangeHandler for DeltaCollector<'_> {
         }
         let spec = map_node(node);
         let old = self.specs.insert(spec.id, spec.clone());
-        self.upserts.push((old, spec));
+        self.delta.upserts.push((old, spec));
         let children = collect_dom_children(node);
         if !children.is_empty() {
-            self.children_ops.push(BridgeOp::SetChildren {
-                parent: node.locate().0,
-                children,
-            });
+            self.delta.children_ops.push((node.locate().0, children));
         }
     }
 
@@ -674,20 +671,19 @@ impl TreeChangeHandler for DeltaCollector<'_> {
         let new_spec = map_node(new_node);
         if self.specs.get(&new_spec.id) != Some(&new_spec) {
             let old = self.specs.insert(new_spec.id, new_spec.clone());
-            self.upserts.push((old, new_spec));
+            self.delta.upserts.push((old, new_spec));
         }
         let old_children = collect_dom_children(old_node);
         let new_children = collect_dom_children(new_node);
         if old_children != new_children {
-            self.children_ops.push(BridgeOp::SetChildren {
-                parent: new_node.locate().0,
-                children: new_children,
-            });
+            self.delta
+                .children_ops
+                .push((new_node.locate().0, new_children));
         }
     }
 
     fn focus_moved(&mut self, _old_node: Option<&Node<'_>>, new_node: Option<&Node<'_>>) {
-        self.focus_change = Some(
+        self.delta.focus_change = Some(
             new_node
                 .filter(|node| !should_skip_node(node))
                 .map(|node| node.locate().0),
@@ -700,7 +696,7 @@ impl TreeChangeHandler for DeltaCollector<'_> {
         }
         let id = node.locate().0;
         self.specs.remove(&id);
-        self.removals.push(id);
+        self.delta.removals.push(id);
     }
 }
 
@@ -1422,18 +1418,20 @@ mod tests {
         let mut out1 = ctx.run_ui(egui::RawInput::default(), |ui| {
             ui.checkbox(&mut checked, "Agree");
         });
-        let ops1 = bridge.apply_update_diff(out1.platform_output.accesskit_update.take().unwrap());
+        let delta1 = bridge.apply_update_diff(out1.platform_output.accesskit_update.take().unwrap());
         out1.drop_without_applying_deltas();
         assert_eq!(bridge.focused_id(), bridge.root_id());
 
-        let cb_id = ops1
+        let cb_id = delta1
+            .upserts
             .iter()
-            .find_map(|op| match op {
-                BridgeOp::Upsert { old, spec } if spec.label.as_deref() == Some("Agree") => {
+            .find_map(|(old, spec)| {
+                if spec.label.as_deref() == Some("Agree") {
                     assert!(old.is_none());
                     Some(spec.id)
+                } else {
+                    None
                 }
-                _ => None,
             })
             .expect("expected checkbox upsert");
 
@@ -1447,17 +1445,109 @@ mod tests {
                 ui.checkbox(&mut checked, "Agree");
             },
         );
-        let ops2 = bridge.apply_update_diff(out2.platform_output.accesskit_update.take().unwrap());
+        let delta2 = bridge.apply_update_diff(out2.platform_output.accesskit_update.take().unwrap());
         out2.drop_without_applying_deltas();
 
         assert_eq!(bridge.focused_id(), Some(cb_id));
-        let updated = ops2.iter().find_map(|op| match op {
-            BridgeOp::Upsert { old, spec } if spec.id == cb_id => Some((old.as_ref(), spec)),
-            _ => None,
-        });
-        let (old, spec) = updated.expect("expected diff upsert for checkbox");
+        let (old, spec) = delta2
+            .upserts
+            .iter()
+            .find_map(|(old, spec)| (spec.id == cb_id).then_some((old.as_ref(), spec)))
+            .expect("expected diff upsert for checkbox");
         assert_eq!(old.unwrap().toggled, Some(Toggled::False));
         assert_eq!(spec.toggled, Some(Toggled::True));
+    }
+
+    #[test]
+    fn maps_rich_aria_metadata_fields() {
+        let root_id = NodeId(1);
+        let input_id = NodeId(2);
+        let err_id = NodeId(3);
+        let desc_id = NodeId(4);
+        let list_id = NodeId(5);
+        let opt_id = NodeId(6);
+        let grid_id = NodeId(7);
+        let row_id = NodeId(8);
+        let cell_id = NodeId(9);
+
+        let mut root = egui::accesskit::Node::new(Role::Window);
+        root.set_children(vec![input_id, err_id, desc_id, list_id, grid_id]);
+
+        let mut input = egui::accesskit::Node::new(Role::TextInput);
+        input.set_required();
+        input.set_invalid(Invalid::Spelling);
+        input.set_error_message(err_id);
+        input.set_described_by(vec![desc_id]);
+
+        let mut err = egui::accesskit::Node::new(Role::Label);
+        err.set_value("Invalid spelling");
+        let mut desc = egui::accesskit::Node::new(Role::Label);
+        desc.set_value("Helper");
+
+        let mut list = egui::accesskit::Node::new(Role::ListBox);
+        list.set_orientation(Orientation::Vertical);
+        list.set_active_descendant(opt_id);
+        list.set_children(vec![opt_id]);
+
+        let mut opt = egui::accesskit::Node::new(Role::ListBoxOption);
+        opt.set_position_in_set(1);
+        opt.set_size_of_set(4);
+
+        let mut grid = egui::accesskit::Node::new(Role::Grid);
+        grid.set_row_count(5);
+        grid.set_column_count(3);
+        grid.set_children(vec![row_id]);
+
+        let mut row = egui::accesskit::Node::new(Role::Row);
+        row.set_row_index(2);
+        row.set_children(vec![cell_id]);
+
+        let mut cell = egui::accesskit::Node::new(Role::GridCell);
+        cell.set_column_index(1);
+
+        let update = TreeUpdate {
+            nodes: vec![
+                (root_id, root),
+                (input_id, input),
+                (err_id, err),
+                (desc_id, desc),
+                (list_id, list),
+                (opt_id, opt),
+                (grid_id, grid),
+                (row_id, row),
+                (cell_id, cell),
+            ],
+            tree: Some(egui::accesskit::Tree::new(root_id)),
+            tree_id: TreeId::ROOT,
+            focus: root_id,
+        };
+
+        let mut bridge = TreeBridge::new();
+        let ops = bridge.apply_update(update);
+
+        let input_spec = find_upsert(&ops, |s| s.id == input_id);
+        assert!(input_spec.required);
+        assert_eq!(input_spec.invalid, Some(Invalid::Spelling));
+        assert_eq!(input_spec.error_message, Some(err_id));
+        assert_eq!(input_spec.described_by, vec![desc_id]);
+
+        let list_spec = find_upsert(&ops, |s| s.id == list_id);
+        assert_eq!(list_spec.orientation, Some(Orientation::Vertical));
+        assert_eq!(list_spec.active_descendant, Some(opt_id));
+
+        let opt_spec = find_upsert(&ops, |s| s.id == opt_id);
+        assert_eq!(opt_spec.position_in_set, Some(1));
+        assert_eq!(opt_spec.size_of_set, Some(4));
+
+        let grid_spec = find_upsert(&ops, |s| s.id == grid_id);
+        assert_eq!(grid_spec.row_count, Some(5));
+        assert_eq!(grid_spec.column_count, Some(3));
+
+        let row_spec = find_upsert(&ops, |s| s.id == row_id);
+        assert_eq!(row_spec.row_index, Some(2));
+
+        let cell_spec = find_upsert(&ops, |s| s.id == cell_id);
+        assert_eq!(cell_spec.column_index, Some(1));
     }
 
     #[test]

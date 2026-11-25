@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "playwright test"
+    "test": "playwright test --project=chrome",
+    "test:firefox": "playwright test --project=firefox"
   },
   "devDependencies": {
     "@axe-core/playwright": "^4.14.0",

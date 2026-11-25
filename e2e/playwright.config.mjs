@@ -5,12 +5,25 @@ export default defineConfig({
   timeout: 30000,
   use: {
     baseURL: "http://127.0.0.1:4173",
-    channel: "chrome",
     headless: true,
-    launchOptions: {
-      args: ["--use-gl=angle", "--use-angle=swiftshader"],
-    },
   },
+  projects: [
+    {
+      name: "chrome",
+      use: {
+        channel: "chrome",
+        launchOptions: {
+          args: ["--use-gl=angle", "--use-angle=swiftshader"],
+        },
+      },
+    },
+    {
+      name: "firefox",
+      use: {
+        browserName: "firefox",
+      },
+    },
+  ],
   webServer: {
     command: "node serve.mjs",
     url: "http://127.0.0.1:4173",
