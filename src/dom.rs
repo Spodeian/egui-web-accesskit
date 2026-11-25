@@ -410,6 +410,8 @@ pub(crate) struct WebDomBridge {
     resize_observer: Option<ActiveResizeObserver>,
     modal_nodes: HashSet<NodeId>,
     modal_dirty: bool,
+    /// Node that held DOM focus when a keyboard-driven modal opened; focus returns here on close.
+    modal_return_focus: Option<NodeId>,
     inert_elements: Vec<Element>,
     queue: ActionQueue,
     repaint_wakeup: RepaintWakeup,
@@ -533,6 +535,7 @@ impl WebDomBridge {
             resize_observer: None,
             modal_nodes: HashSet::new(),
             modal_dirty: false,
+            modal_return_focus: None,
             inert_elements: Vec::new(),
             queue,
             repaint_wakeup: Rc::new(RefCell::new(Some(wakeup))),
@@ -930,6 +933,27 @@ impl WebDomBridge {
                 );
                 return;
             }
+            if key == "Tab"
+                && !kb.is_composing()
+                && let Some(current) = event.target().and_then(|t| t.dyn_into::<Element>().ok())
+            {
+                let backwards = kb.shift_key();
+                let next = try_with_bridge_mut(id, |bridge| {
+                    bridge.modal_tab_target(&current, backwards)
+                })
+                .flatten();
+                if let Some(next) = next {
+                    event.prevent_default();
+                    event.stop_propagation();
+                    // Focus moves after the bridge borrow ends; the focus listener then reports
+                    // the change to egui.
+                    if let Some(html) = next.dyn_ref::<HtmlElement>() {
+                        let options = FocusOptions::new();
+                        options.set_prevent_scroll(true);
+                        let _ = html.focus_with_options(&options);
+                    }
+                }
+            }
             let Some((target, node_id)) = event_node_target(&event) else {
                 return;
             };
@@ -1027,6 +1051,7 @@ impl WebDomBridge {
         let prev_focused_id = active_element_for(self.container.as_ref(), &self.document)
             .filter(|active| self.container.contains(Some(active.as_ref())))
             .and_then(|el| parse_node_id(&el));
+        let had_modal = !self.modal_nodes.is_empty();
 
         let (scale, scale_changed) = self.sync_viewport();
         let TreeDelta {
@@ -1077,10 +1102,70 @@ impl WebDomBridge {
         self.reconcile_text_inputs();
         self.sync_modal_inert();
 
+        // `sync_modal_inert` marks the opener `inert`, which makes the browser drop DOM focus to
+        // `document.body`. Keyboard users must therefore be moved into the dialog, and back out
+        // to the opener when it closes (WAI-ARIA dialog pattern).
+        let has_modal = !self.modal_nodes.is_empty();
+        if !had_modal && has_modal {
+            self.focus_modal_on_open(prev_focused_id);
+        } else if had_modal && !has_modal {
+            self.restore_focus_after_modal();
+        }
+
         if scale_changed {
             self.reapply_all_bounds(scale);
         }
         self.dom_action_in_flight = false;
+    }
+
+    /// Moves focus into the top modal after it opens from a DOM-driven action (keyboard or a
+    /// focused control). Pointer-opened modals leave focus on the `<canvas>`.
+    fn focus_modal_on_open(&mut self, opener: Option<NodeId>) {
+        if opener.is_none() && !self.dom_action_in_flight {
+            return;
+        }
+        let Some(modal_el) = self.find_top_modal_element() else {
+            return;
+        };
+        if active_element_for(self.container.as_ref(), &self.document)
+            .is_some_and(|active| modal_el.contains(Some(active.as_ref())))
+        {
+            return;
+        }
+        let target = first_focusable_within(&modal_el).unwrap_or_else(|| {
+            let _ = modal_el.set_attribute("tabindex", "-1");
+            modal_el.clone()
+        });
+        self.modal_return_focus = opener;
+        self.focus_element(&target);
+        if let Some(id) = parse_node_id(&target) {
+            push_action(&self.queue, &self.repaint_wakeup, focus_action(id));
+        }
+    }
+
+    /// Returns focus to the control that opened a modal once the modal is gone, but only when
+    /// focus fell back to `document.body`, so focus the user moved elsewhere is never stolen.
+    fn restore_focus_after_modal(&mut self) {
+        let Some(prev) = self.modal_return_focus.take() else {
+            return;
+        };
+        let fell_to_body = active_element_for(self.container.as_ref(), &self.document)
+            .is_none_or(|el| el.tag_name().eq_ignore_ascii_case("BODY"));
+        if !fell_to_body {
+            return;
+        }
+        let Some(el) = self.elements.get(&prev).cloned() else {
+            return;
+        };
+        if !self
+            .tree
+            .spec(prev)
+            .is_some_and(|s| s.focusable && !s.disabled)
+        {
+            return;
+        }
+        self.focus_element(&el);
+        push_action(&self.queue, &self.repaint_wakeup, focus_action(prev));
     }
 
     pub(crate) fn realign_viewport(&mut self) {
@@ -1102,6 +1187,7 @@ impl WebDomBridge {
         self.clear_modal_inert();
         self.modal_nodes.clear();
         self.modal_dirty = false;
+        self.modal_return_focus = None;
         self.dom_owned_selection.borrow_mut().clear();
         self.composing_nodes.borrow_mut().clear();
         self.password_prev.clear();
@@ -1165,6 +1251,31 @@ impl WebDomBridge {
                 break;
             }
             current = parent;
+        }
+    }
+
+    /// While a modal is open, keeps Tab / Shift+Tab focus inside it (focus trap).
+    ///
+    /// Returns the element that should take focus when `current` sits at the edge of the
+    /// dialog. `None` leaves the browser's native Tab movement alone.
+    fn modal_tab_target(&self, current: &Element, backwards: bool) -> Option<Element> {
+        let modal = self.find_top_modal_element()?;
+        let focusables: Vec<Element> = match modal.query_selector_all(FOCUSABLE_SELECTOR) {
+            Ok(list) => (0..list.length())
+                .filter_map(|i| list.item(i)?.dyn_into::<Element>().ok())
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        let (Some(first), Some(last)) = (focusables.first(), focusables.last()) else {
+            // Nothing inside the dialog can take focus; keep it on the dialog itself.
+            let _ = modal.set_attribute("tabindex", "-1");
+            return Some(modal);
+        };
+        let index = focusables.iter().position(|el| el == current);
+        if backwards {
+            (index.is_none_or(|i| i == 0)).then(|| last.clone())
+        } else {
+            (index.is_none_or(|i| i + 1 == focusables.len())).then(|| first.clone())
         }
     }
 
@@ -1499,6 +1610,9 @@ impl WebDomBridge {
         if self.deferred_focus_target == Some(id) {
             self.deferred_focus_target = None;
         }
+        if self.modal_return_focus == Some(id) {
+            self.modal_return_focus = None;
+        }
         if let Some(old_hoisted) = self.hoisted_children.remove(&id) {
             let container_node: &web_sys::Node = self.container.as_ref();
             for child_id in old_hoisted {
@@ -1548,9 +1662,14 @@ impl WebDomBridge {
         if Some(target_id) == self.tree.root_id() {
             return;
         }
-        let Some(el) = self.elements.get(&target_id) else {
+        let Some(el) = self.elements.get(&target_id).cloned() else {
             return;
         };
+        self.focus_element(&el);
+    }
+
+    /// Focuses `el` without echoing a redundant `Action::Focus` back to `egui`.
+    fn focus_element(&self, el: &Element) {
         if active_element_for(self.container.as_ref(), &self.document)
             .is_some_and(|active| active == *el)
         {
@@ -1564,6 +1683,17 @@ impl WebDomBridge {
             self.syncing_focus.set(false);
         }
     }
+}
+
+/// Selector for keyboard-focusable mirrored controls, used for dialog focus entry and trapping.
+const FOCUSABLE_SELECTOR: &str = "button:not([disabled]):not([aria-disabled='true']), \
+     input:not([disabled]):not([type='hidden']):not([aria-disabled='true']), \
+     select:not([disabled]), textarea:not([disabled]), a[href], \
+     [tabindex]:not([tabindex='-1']):not([aria-disabled='true'])";
+
+/// First keyboard-focusable descendant of a dialog, in document order.
+fn first_focusable_within(root: &Element) -> Option<Element> {
+    root.query_selector(FOCUSABLE_SELECTOR).ok().flatten()
 }
 
 fn commit_text_value(
@@ -1821,8 +1951,31 @@ fn safe_href(url: Option<&str>) -> &str {
     }
 }
 
-fn is_password_mask_char(c: char) -> bool {
+/// Single-byte glyph used for masked characters inside the DOM `<input type="password">`.
+const DOM_PASSWORD_MASK: char = '*';
+
+/// Characters egui uses to mask password text (`•` from `epaint`, plus `●` for compatibility).
+fn is_egui_password_mask_char(c: char) -> bool {
     matches!(c, '\u{25CF}' | '\u{2022}')
+}
+
+/// True for characters that belong to the masked DOM representation of a password value.
+fn is_password_mask_char(c: char) -> bool {
+    c == DOM_PASSWORD_MASK || is_egui_password_mask_char(c)
+}
+
+/// Converts egui's masked password text into the DOM mask. Both representations are single
+/// UTF-16 code units, so UTF-16 selection offsets are identical on either side.
+fn dom_password_mask(val: &str) -> String {
+    val.chars()
+        .map(|c| {
+            if is_egui_password_mask_char(c) {
+                DOM_PASSWORD_MASK
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 fn password_diff_utf16(old: &str, new: &str) -> (usize, usize, String) {
@@ -1869,6 +2022,25 @@ fn effective_role_for(spec: &DomNodeSpec) -> Option<&'static str> {
     }
 }
 
+/// Accessible name written to `aria-label`: the explicit label, else a role-based fallback.
+fn accessible_name(spec: &DomNodeSpec) -> Option<&str> {
+    spec.label
+        .as_deref()
+        .or_else(|| match effective_role_for(spec) {
+            Some("dialog") => Some("Dialog"),
+            Some("alertdialog") => Some("Alert dialog"),
+            Some("progressbar") => Some("Progress"),
+            Some("listbox") => Some("Options"),
+            Some("combobox") => spec
+                .value
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .or(Some("Select")),
+            Some("spinbutton") => Some("Numeric input"),
+            _ => None,
+        })
+}
+
 fn sync_disclosure_attrs(
     element: &Element,
     spec: &DomNodeSpec,
@@ -1905,11 +2077,14 @@ fn sync_text_element_value(element: &Element, spec: &DomNodeSpec) {
         {
             let val = spec.value.as_deref().unwrap_or("");
             if spec.input_type == Some("password") {
+                // Chromium exposes a password field's value to assistive tech as one mask glyph
+                // per UTF-8 byte, so egui's 3-byte bullets would be read as three glyphs each.
+                let masked = dom_password_mask(val);
                 let current = input_el.value();
-                if current.chars().count() != val.chars().count()
-                    || (val.is_empty() && !current.is_empty())
+                if current.chars().count() != masked.chars().count()
+                    || (masked.is_empty() && !current.is_empty())
                 {
-                    input_el.set_value(val);
+                    input_el.set_value(&masked);
                 }
             } else if input_el.value() != val {
                 input_el.set_value(val);
@@ -1939,33 +2114,14 @@ fn apply_dom_attributes(
         Some("slider" | "spinbutton" | "progressbar" | "scrollbar" | "meter")
     ) || matches!(spec.input_type, Some("range" | "number"));
 
-    let fallback_label = if spec.label.is_none() {
-        match effective_role {
-            Some("dialog") => Some("Dialog"),
-            Some("alertdialog") => Some("Alert dialog"),
-            Some("progressbar") => Some("Progress"),
-            Some("listbox") => Some("Options"),
-            Some("combobox") => spec
-                .value
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .or(Some("Select")),
-            Some("spinbutton") => Some("Numeric input"),
-            _ => None,
-        }
-    } else {
-        None
-    };
-
     if role_changed {
         set_optional_attr(element, "role", effective_role);
     }
-    if role_changed || old.is_none_or(|o| o.label != spec.label || o.value != spec.value) {
-        set_optional_attr(
-            element,
-            "aria-label",
-            spec.label.as_deref().or(fallback_label),
-        );
+    // Only rewrite `aria-label` when the accessible name really changes. Rewriting it on every
+    // value change (e.g. each keystroke in a text field) makes Chromium report a name change,
+    // which screen readers announce again, for example as "blank" after Backspace.
+    if role_changed || old.is_none_or(|o| accessible_name(o) != accessible_name(spec)) {
+        set_optional_attr(element, "aria-label", accessible_name(spec));
     }
     if old.is_none_or(|o| o.description != spec.description) {
         set_optional_attr(element, "aria-description", spec.description.as_deref());
@@ -2021,6 +2177,13 @@ fn apply_dom_attributes(
             Invalid::Spelling => "spelling",
         });
         set_optional_attr(element, "aria-invalid", invalid);
+    }
+    if old.is_none_or(|o| o.auto_complete != spec.auto_complete) {
+        // Only emitted when the application explicitly sets an AccessKit autocomplete mode.
+        let autocomplete = matches!(spec.tag, DomTag::Input | DomTag::TextArea)
+            .then_some(spec.auto_complete)
+            .flatten();
+        set_optional_attr(element, "aria-autocomplete", autocomplete);
     }
     if old.is_none_or(|o| o.error_message != spec.error_message) {
         let err_id = spec.error_message.map(|id| dom_element_id(bridge_id, id));

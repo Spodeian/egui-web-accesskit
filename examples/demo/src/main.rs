@@ -38,6 +38,7 @@ struct DemoApp {
     note_submitted: u32,
     force_warning: bool,
     bio: String,
+    search: String,
     secret: String,
     muted: bool,
     live_status: &'static str,
@@ -61,6 +62,7 @@ impl Default for DemoApp {
             note_submitted: 0,
             force_warning: false,
             bio: String::from("Line 1"),
+            search: String::new(),
             secret: String::from("s3cr3t"),
             muted: false,
             live_status: "Audio active",
@@ -180,6 +182,22 @@ impl eframe::App for DemoApp {
                         let label = ui.label("Token:");
                         let mut token: &str = "RO-123";
                         ui.text_edit_singleline(&mut token).labelled_by(label.id);
+                    });
+                });
+
+                // Explicit AccessKit autocomplete: the only field that should expose aria-autocomplete.
+                scoped_row(&mut cols[0], "search_row", |ui| {
+                    ui.horizontal(|ui| {
+                        let label = ui.label("Search:");
+                        let search = ui
+                            .add(
+                                egui::TextEdit::singleline(&mut self.search)
+                                    .hint_text("Type to search"),
+                            )
+                            .labelled_by(label.id);
+                        ui.ctx().accesskit_node_builder(search.id, |node| {
+                            node.set_auto_complete(egui::accesskit::AutoComplete::List);
+                        });
                     });
                 });
 

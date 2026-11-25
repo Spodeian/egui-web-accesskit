@@ -354,6 +354,150 @@ test.describe("egui-web-accesskit E2E", () => {
     expect(errors).toEqual([]);
   });
 
+  test("keyboard Enter/Space opens a dialog, keeps focus inside it, traps Tab, and restores focus on Escape", async ({
+    page,
+  }) => {
+    const errors = [];
+    page.on("pageerror", (err) => errors.push(err.message));
+
+    await page.goto("/");
+    const overlay = page.locator('[data-egui-accesskit="true"]');
+    await expect(overlay).toBeAttached({ timeout: 15000 });
+
+    const trigger = overlay.getByRole("button", { name: "Open dialog" });
+    const modal = overlay.getByRole("alertdialog", { name: "Confirmation dialog" });
+    const closeBtn = overlay.getByRole("button", { name: "Close dialog" });
+    const incBtn = overlay.getByRole("button", { name: "Increment counter" });
+
+    for (const key of ["Enter", "Space"]) {
+      await trigger.focus();
+      await expect(trigger).toBeFocused();
+      await page.keyboard.press(key);
+
+      // Focus must move into the dialog instead of falling back to document.body.
+      await expect(modal).toBeAttached();
+      await expect(closeBtn).toBeFocused();
+      expect(await incBtn.evaluate((el) => el.closest("[inert]") !== null)).toBe(true);
+
+      // Tab/Shift+Tab stay inside the dialog (its only focusable control).
+      await page.keyboard.press("Tab");
+      await expect(closeBtn).toBeFocused();
+      await page.keyboard.press("Shift+Tab");
+      await expect(closeBtn).toBeFocused();
+
+      // Escape closes the dialog, returns focus to the opener, and clears the inert background.
+      await page.keyboard.press("Escape");
+      await expect(modal).toHaveCount(0);
+      await expect(trigger).toBeFocused();
+      expect(await incBtn.evaluate((el) => el.closest("[inert]") !== null)).toBe(false);
+    }
+
+    expect(errors).toEqual([]);
+  });
+
+  test("text edits do not rewrite the accessible name, so Backspace is silent once the field is empty", async ({
+    page,
+  }) => {
+    const errors = [];
+    page.on("pageerror", (err) => errors.push(err.message));
+
+    await page.goto("/");
+    const overlay = page.locator('[data-egui-accesskit="true"]');
+    await expect(overlay).toBeAttached({ timeout: 15000 });
+
+    const noteBox = overlay.getByRole("textbox", { name: "Note:" });
+    await overlay.getByRole("button", { name: "Clear note" }).evaluate((el) => el.click());
+    await expect(noteBox).toHaveValue("");
+
+    await noteBox.focus();
+    await page.evaluate(() => {
+      window.__inputAttrMutations = [];
+      const input = document.querySelector('[data-egui-accesskit="true"] input[aria-label="Note:"]');
+      window.__noteInput = input;
+      const observer = new MutationObserver((records) => {
+        for (const record of records) {
+          if (record.target === input) {
+            window.__inputAttrMutations.push(record.attributeName);
+          }
+        }
+      });
+      observer.observe(document.querySelector('[data-egui-accesskit="true"]'), {
+        attributes: true,
+        subtree: true,
+      });
+      window.__noteObserver = observer;
+    });
+
+    await page.keyboard.type("ab");
+    await expect(noteBox).toHaveValue("ab");
+    await page.keyboard.press("Backspace");
+    await expect(noteBox).toHaveValue("a");
+    await page.keyboard.press("Backspace");
+    await expect(noteBox).toHaveValue("");
+    await page.keyboard.press("Backspace");
+    await expect(noteBox).toHaveValue("");
+    await page.waitForTimeout(200);
+
+    const mutations = await page.evaluate(() => {
+      window.__noteObserver.disconnect();
+      return window.__inputAttrMutations;
+    });
+    expect(mutations).toEqual([]);
+
+    expect(errors).toEqual([]);
+  });
+
+  test("password field exposes one mask glyph per character and never plaintext", async ({
+    page,
+    browserName,
+  }) => {
+    const errors = [];
+    page.on("pageerror", (err) => errors.push(err.message));
+
+    await page.goto("/");
+    const overlay = page.locator('[data-egui-accesskit="true"]');
+    await expect(overlay).toBeAttached({ timeout: 15000 });
+
+    const pwBox = overlay.getByLabel("Password:");
+    await expect(pwBox).toHaveAttribute("type", "password");
+    const domValue = await pwBox.inputValue();
+    expect(domValue).toMatch(/^\*+$/);
+    expect(domValue.length).toBe(6);
+
+    if (browserName === "chromium") {
+      // Chromium exposes the masked value to assistive tech; each mask glyph must map to exactly one
+      // character (multi-byte bullets used to surface as three glyphs per character).
+      const cdp = await page.context().newCDPSession(page);
+      await cdp.send("Accessibility.enable");
+      const { nodes } = await cdp.send("Accessibility.getFullAXTree");
+      const pwNode = nodes.find(
+        (n) => n.role?.value === "textbox" && n.name?.value === "Password:"
+      );
+      expect(pwNode).toBeTruthy();
+      expect(pwNode.value?.value?.length).toBe(6);
+      expect(pwNode.value?.value).toMatch(/^\u2022+$/);
+    }
+
+    expect(errors).toEqual([]);
+  });
+
+  test("aria-autocomplete is mirrored only when the application sets it", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    const overlay = page.locator('[data-egui-accesskit="true"]');
+    await expect(overlay).toBeAttached({ timeout: 15000 });
+
+    const searchBox = overlay.getByRole("textbox", { name: "Search:" });
+    await expect(searchBox).toHaveAttribute("aria-autocomplete", "list");
+    await expect(overlay.locator("[aria-autocomplete]")).toHaveCount(1);
+    expect(
+      await overlay
+        .getByRole("textbox", { name: "Note:" })
+        .evaluate((el) => el.hasAttribute("aria-autocomplete"))
+    ).toBe(false);
+  });
+
   test("supports Shadow DOM via WebAccessKitPlugin::from_canvas", async ({
     page,
   }) => {

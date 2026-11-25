@@ -7,8 +7,8 @@ use std::collections::HashMap;
 
 use accesskit_consumer::{FilterResult, NodeRef, Tree, TreeChangeHandler};
 use egui::accesskit::{
-    Action, ActionData, ActionRequest, Invalid, Live, NodeId, Orientation, Rect, Role,
-    TextSelection, Toggled, TreeId, TreeUpdate,
+    Action, ActionData, ActionRequest, AutoComplete, Invalid, Live, NodeId, Orientation, Rect,
+    Role, TextSelection, Toggled, TreeId, TreeUpdate,
 };
 use egui::{Event, Key, Modifiers};
 
@@ -130,6 +130,9 @@ pub struct DomNodeSpec {
     pub row_index: Option<usize>,
     /// 0-based column index (`aria-colindex` emits `+ 1`).
     pub column_index: Option<usize>,
+    /// Autocomplete behaviour (`aria-autocomplete`). `None` unless the application explicitly
+    /// set an AccessKit autocomplete mode, so plain text fields never advertise autocomplete.
+    pub auto_complete: Option<&'static str>,
 }
 
 /// Incremental DOM mutation produced by [`TreeBridge::apply_update`].
@@ -331,6 +334,11 @@ pub fn map_node(node: &NodeRef<'_>) -> DomNodeSpec {
         column_count: data.column_count(),
         row_index: data.row_index(),
         column_index: data.column_index(),
+        auto_complete: data.auto_complete().map(|mode| match mode {
+            AutoComplete::Inline => "inline",
+            AutoComplete::List => "list",
+            AutoComplete::Both => "both",
+        }),
     }
 }
 
@@ -1528,6 +1536,7 @@ mod tests {
         input.set_invalid(Invalid::Spelling);
         input.set_error_message(err_id);
         input.set_described_by(vec![desc_id]);
+        input.set_auto_complete(AutoComplete::List);
 
         let mut err = egui::accesskit::Node::new(Role::Label);
         err.set_value("Invalid spelling");
@@ -1580,6 +1589,10 @@ mod tests {
         assert_eq!(input_spec.invalid, Some(Invalid::Spelling));
         assert_eq!(input_spec.error_message, Some(err_id));
         assert_eq!(input_spec.described_by, vec![desc_id]);
+        assert_eq!(input_spec.auto_complete, Some("list"));
+
+        let err_spec = find_upsert(&ops, |s| s.id == err_id);
+        assert_eq!(err_spec.auto_complete, None);
 
         let list_spec = find_upsert(&ops, |s| s.id == list_id);
         assert_eq!(list_spec.orientation, Some(Orientation::Vertical));
