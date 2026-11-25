@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -12,14 +13,15 @@ use web_sys::{
 };
 
 use crate::mapper::{
-    BridgeOp, DomNodeSpec, DomTag, TreeBridge, click_action, decrement_action, focus_action,
+    DomNodeSpec, DomTag, TreeBridge, TreeDelta, click_action, decrement_action, focus_action,
     increment_action, replace_selected_text_action, scroll_action, scroll_into_view_action,
     set_numeric_value_action, set_value_action,
 };
-use egui::accesskit::{Action, ActionRequest, Live, NodeId, Rect, Toggled};
+use egui::accesskit::{Action, ActionRequest, Invalid, Live, NodeId, Orientation, Rect, Toggled};
 
 pub(crate) enum PendingDomEvent {
     Action(ActionRequest),
+    KeyPress(egui::Key),
     SetValue {
         target_node: NodeId,
         value: String,
@@ -38,12 +40,13 @@ pub(crate) enum PendingDomEvent {
 }
 
 impl PendingDomEvent {
-    fn target_node(&self) -> NodeId {
+    fn target_node(&self) -> Option<NodeId> {
         match self {
-            Self::Action(req) => req.target_node,
+            Self::Action(req) => Some(req.target_node),
+            Self::KeyPress(_) => None,
             Self::SetValue { target_node, .. }
             | Self::ReplaceRange { target_node, .. }
-            | Self::TextSelection { target_node, .. } => *target_node,
+            | Self::TextSelection { target_node, .. } => Some(*target_node),
         }
     }
 
@@ -53,12 +56,12 @@ impl PendingDomEvent {
             Self::Action(req) => {
                 matches!(req.action, Action::SetValue | Action::ReplaceSelectedText)
             }
-            Self::TextSelection { .. } => false,
+            Self::KeyPress(_) | Self::TextSelection { .. } => false,
         }
     }
 
     fn targets_text_state(&self, node: NodeId) -> bool {
-        if self.target_node() != node {
+        if self.target_node() != Some(node) {
             return false;
         }
         match self {
@@ -67,12 +70,14 @@ impl PendingDomEvent {
                 req.action,
                 Action::SetValue | Action::ReplaceSelectedText | Action::SetTextSelection
             ),
+            Self::KeyPress(_) => false,
         }
     }
 }
 
 pub(crate) type ActionQueue = Arc<Mutex<Vec<PendingDomEvent>>>;
 type RepaintWakeup = Rc<RefCell<Option<Box<dyn Fn()>>>>;
+type ActivateCallback = Box<dyn FnMut()>;
 
 thread_local! {
     static BRIDGES: RefCell<HashMap<u64, WebDomBridge>> = RefCell::new(HashMap::new());
@@ -93,6 +98,30 @@ pub(crate) fn insert_bridge(id: u64, bridge: WebDomBridge) {
 
 pub(crate) fn with_bridge_mut<R>(id: u64, f: impl FnOnce(&mut WebDomBridge) -> R) -> Option<R> {
     BRIDGES.with(|bridges| bridges.borrow_mut().get_mut(&id).map(f))
+}
+
+pub(crate) fn try_with_bridge_mut<R>(id: u64, f: impl FnOnce(&mut WebDomBridge) -> R) -> Option<R> {
+    BRIDGES.with(|bridges| {
+        let Ok(mut map) = bridges.try_borrow_mut() else {
+            return None;
+        };
+        map.get_mut(&id).map(f)
+    })
+}
+
+pub(crate) fn activate_bridge(id: u64) {
+    activate_bridge_inner(id, false);
+}
+
+fn activate_bridge_from_dom(id: u64) {
+    activate_bridge_inner(id, true);
+}
+
+fn activate_bridge_inner(id: u64, from_dom: bool) {
+    let cb = try_with_bridge_mut(id, |bridge| bridge.take_activation(from_dom)).flatten();
+    if let Some(mut cb) = cb {
+        cb();
+    }
 }
 
 pub(crate) fn install_viewport_listeners(id: u64) {
@@ -128,6 +157,22 @@ pub(crate) fn drain_pending_events(
                         focus_requested.insert(req.target_node);
                     }
                     out.push(egui::Event::AccessKitActionRequest(req));
+                }
+                PendingDomEvent::KeyPress(key) => {
+                    out.push(egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                    out.push(egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: false,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    });
                 }
                 PendingDomEvent::SetValue { target_node, value } => {
                     if bridge.tree.supports_text_edit_actions(target_node) {
@@ -351,12 +396,16 @@ pub(crate) struct WebDomBridge {
     document: Document,
     canvas: Option<Element>,
     container: Element,
+    activated: bool,
+    activate_button: Option<Element>,
+    activate_cb: Option<ActivateCallback>,
     tree: TreeBridge,
     elements: HashMap<NodeId, Element>,
     hoisted_children: HashMap<NodeId, Vec<NodeId>>,
-    listeners: HashMap<NodeId, Vec<AttachedListener>>,
     viewport_listeners: Vec<AttachedListener>,
     resize_observer: Option<ActiveResizeObserver>,
+    modal_nodes: HashSet<NodeId>,
+    modal_dirty: bool,
     inert_elements: Vec<Element>,
     queue: ActionQueue,
     repaint_wakeup: RepaintWakeup,
@@ -364,19 +413,26 @@ pub(crate) struct WebDomBridge {
     syncing_selection: Rc<Cell<bool>>,
     dom_owned_selection: Rc<RefCell<HashSet<NodeId>>>,
     composing_nodes: Rc<RefCell<HashSet<NodeId>>>,
+    password_prev: HashMap<NodeId, String>,
     pending_text_reconcile: HashSet<NodeId>,
     dom_action_in_flight: bool,
     deferred_focus_target: Option<NodeId>,
+    viewport_dirty: bool,
+    last_dpr: f64,
+    last_buf_size: (u32, u32),
     last_canvas_rect: Option<(f64, f64, f64, f64)>,
     last_scale: Option<(f64, f64)>,
+    bounds_buf: String,
 }
 
 impl WebDomBridge {
     pub(crate) fn mount(
         id: u64,
         canvas_id: &str,
+        lazy: bool,
         queue: ActionQueue,
         wakeup: Box<dyn Fn()>,
+        activate: ActivateCallback,
     ) -> Option<Self> {
         let window = web_sys::window()?;
         let document = window.document()?;
@@ -433,18 +489,46 @@ impl WebDomBridge {
             return None;
         }
 
+        let activate_button = if lazy {
+            let btn = document.create_element("button").ok()?;
+            let _ = btn.set_attribute("type", "button");
+            let _ = btn.set_attribute("data-egui-accesskit-activate", "true");
+            let _ = btn.set_attribute("aria-label", "Enable screen reader accessibility");
+            btn.set_text_content(Some("Enable screen reader accessibility"));
+            if let Some(html) = btn.dyn_ref::<HtmlElement>() {
+                let style = html.style();
+                let _ = style.set_property("position", "absolute");
+                let _ = style.set_property("left", "0px");
+                let _ = style.set_property("top", "0px");
+                let _ = style.set_property("width", "1px");
+                let _ = style.set_property("height", "1px");
+                let _ = style.set_property("margin", "0");
+                let _ = style.set_property("padding", "0");
+                let _ = style.set_property("border", "0");
+                let _ = style.set_property("pointer-events", "none");
+            }
+            let _ = container.append_child(&btn);
+            Some(btn)
+        } else {
+            None
+        };
+
         let mut bridge = Self {
             bridge_id: id,
             window,
             document,
             canvas,
             container,
+            activated: !lazy,
+            activate_button,
+            activate_cb: lazy.then_some(activate),
             tree: TreeBridge::new(),
             elements: HashMap::new(),
             hoisted_children: HashMap::new(),
-            listeners: HashMap::new(),
             viewport_listeners: Vec::new(),
             resize_observer: None,
+            modal_nodes: HashSet::new(),
+            modal_dirty: false,
             inert_elements: Vec::new(),
             queue,
             repaint_wakeup: Rc::new(RefCell::new(Some(wakeup))),
@@ -452,14 +536,36 @@ impl WebDomBridge {
             syncing_selection: Rc::new(Cell::new(false)),
             dom_owned_selection: Rc::new(RefCell::new(HashSet::new())),
             composing_nodes: Rc::new(RefCell::new(HashSet::new())),
+            password_prev: HashMap::new(),
             pending_text_reconcile: HashSet::new(),
             dom_action_in_flight: false,
             deferred_focus_target: None,
+            viewport_dirty: true,
+            last_dpr: 0.0,
+            last_buf_size: (0, 0),
             last_canvas_rect: None,
             last_scale: None,
+            bounds_buf: String::with_capacity(32),
         };
-        let _ = bridge.sync_viewport();
+        if bridge.activated {
+            let _ = bridge.sync_viewport();
+        }
         Some(bridge)
+    }
+
+    fn take_activation(&mut self, from_dom: bool) -> Option<ActivateCallback> {
+        if let Some(btn) = self.activate_button.take() {
+            btn.remove();
+        }
+        if self.activated {
+            return None;
+        }
+        self.activated = true;
+        self.viewport_dirty = true;
+        if from_dom {
+            self.dom_action_in_flight = true;
+        }
+        self.activate_cb.take()
     }
 
     fn install_viewport_listeners(&mut self, id: u64) {
@@ -468,13 +574,13 @@ impl WebDomBridge {
 
         let window_target: web_sys::EventTarget = self.window.clone().into();
         if let Some(l) = add_listener_with_options(&window_target, "scroll", true, true, move |_| {
-            with_bridge_mut(id, Self::realign_viewport);
+            try_with_bridge_mut(id, Self::realign_viewport);
         }) {
             self.viewport_listeners.push(l);
         }
         if let Some(l) =
             add_listener_with_options(&window_target, "resize", false, true, move |_| {
-                with_bridge_mut(id, Self::realign_viewport);
+                try_with_bridge_mut(id, Self::realign_viewport);
             })
         {
             self.viewport_listeners.push(l);
@@ -482,7 +588,7 @@ impl WebDomBridge {
 
         if let Some(canvas) = &self.canvas {
             let closure = Closure::wrap(Box::new(move || {
-                with_bridge_mut(id, Self::realign_viewport);
+                try_with_bridge_mut(id, Self::realign_viewport);
             }) as Box<dyn FnMut()>);
             if let Ok(observer) = ResizeObserver::new(closure.as_ref().unchecked_ref()) {
                 observer.observe(canvas);
@@ -494,32 +600,412 @@ impl WebDomBridge {
         }
 
         let container_target: web_sys::EventTarget = self.container.clone().into();
+
+        // 1. Focus (capture phase because focus does not bubble).
+        let syncing_focus = Rc::clone(&self.syncing_focus);
+        let queue = Arc::clone(&self.queue);
+        let wakeup = Rc::clone(&self.repaint_wakeup);
+        if let Some(l) =
+            add_listener_with_options(&container_target, "focus", true, true, move |event| {
+                if syncing_focus.get() {
+                    return;
+                }
+                let Some(target) = event.target().and_then(|t| t.dyn_into::<Element>().ok())
+                else {
+                    return;
+                };
+                if target.has_attribute("data-egui-accesskit-activate") {
+                    activate_bridge_from_dom(id);
+                    return;
+                }
+                let Some(node_id) = parse_node_id(&target) else {
+                    return;
+                };
+                let should_focus = try_with_bridge_mut(id, |bridge| {
+                    let Some(spec) = bridge.tree.spec(node_id) else {
+                        return false;
+                    };
+                    if InteractionKind::from_spec(spec) == InteractionKind::Text
+                        && !spec.read_only
+                        && spec.input_type == Some("password")
+                        && let Some(val) = read_text_value(&target)
+                    {
+                        bridge.password_prev.insert(node_id, val);
+                    }
+                    spec.focusable && !spec.disabled && Some(node_id) != bridge.tree.root_id()
+                })
+                .unwrap_or(false);
+                if should_focus {
+                    push_events(
+                        &queue,
+                        &wakeup,
+                        [
+                            PendingDomEvent::Action(focus_action(node_id)),
+                            PendingDomEvent::Action(scroll_into_view_action(node_id)),
+                        ],
+                    );
+                }
+            })
+        {
+            self.viewport_listeners.push(l);
+        }
+
+        // 2. Click delegation.
+        let queue = Arc::clone(&self.queue);
+        let wakeup = Rc::clone(&self.repaint_wakeup);
+        if let Some(l) = add_listener(&container_target, "click", move |event| {
+            let Some(target) = event.target().and_then(|t| t.dyn_into::<Element>().ok()) else {
+                return;
+            };
+            if target.has_attribute("data-egui-accesskit-activate") {
+                event.prevent_default();
+                event.stop_propagation();
+                activate_bridge_from_dom(id);
+                return;
+            }
+            let Some(node_id) = parse_node_id(&target) else {
+                return;
+            };
+            let clickable_anchor = try_with_bridge_mut(id, |bridge| {
+                let spec = bridge.tree.spec(node_id)?;
+                (InteractionKind::from_spec(spec) == InteractionKind::Click)
+                    .then_some(spec.tag == DomTag::Anchor)
+            })
+            .flatten();
+            if let Some(is_anchor) = clickable_anchor {
+                if is_anchor {
+                    event.prevent_default();
+                }
+                event.stop_propagation();
+                push_action(&queue, &wakeup, click_action(node_id));
+            }
+        }) {
+            self.viewport_listeners.push(l);
+        }
+
+        // 3. BeforeInput delegation (password snapshot before edits).
+        if let Some(l) =
+            add_listener_with_options(&container_target, "beforeinput", false, true, move |event| {
+                let Some((target, node_id)) = event_node_target(&event) else {
+                    return;
+                };
+                try_with_bridge_mut(id, |bridge| {
+                    if let Some(spec) = bridge.tree.spec(node_id)
+                        && InteractionKind::from_spec(spec) == InteractionKind::Text
+                        && !spec.read_only
+                        && spec.input_type == Some("password")
+                        && let Some(val) = read_text_value(&target)
+                    {
+                        bridge.password_prev.insert(node_id, val);
+                    }
+                });
+            })
+        {
+            self.viewport_listeners.push(l);
+        }
+
+        // 4. CompositionStart delegation.
+        if let Some(l) = add_listener_with_options(
+            &container_target,
+            "compositionstart",
+            false,
+            true,
+            move |event| {
+                let Some((_, node_id)) = event_node_target(&event) else {
+                    return;
+                };
+                let hit = try_with_bridge_mut(id, |bridge| {
+                    if let Some(spec) = bridge.tree.spec(node_id)
+                        && InteractionKind::from_spec(spec) == InteractionKind::Text
+                        && !spec.read_only
+                    {
+                        bridge.composing_nodes.borrow_mut().insert(node_id);
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .unwrap_or(false);
+                if hit {
+                    event.stop_propagation();
+                }
+            },
+        ) {
+            self.viewport_listeners.push(l);
+        }
+
+        // 5. Input delegation (text + numeric sliders/spinbuttons).
+        let queue = Arc::clone(&self.queue);
+        let wakeup = Rc::clone(&self.repaint_wakeup);
+        let dom_owned = Rc::clone(&self.dom_owned_selection);
+        let composing = Rc::clone(&self.composing_nodes);
+        if let Some(l) =
+            add_listener_with_options(&container_target, "input", false, true, move |event| {
+                let Some((target, node_id)) = event_node_target(&event) else {
+                    return;
+                };
+                let is_composing = event
+                    .dyn_ref::<InputEvent>()
+                    .is_some_and(|ie| ie.is_composing());
+                let action = try_with_bridge_mut(id, |bridge| {
+                    let spec = bridge.tree.spec(node_id)?;
+                    match InteractionKind::from_spec(spec) {
+                        InteractionKind::Text if !spec.read_only => Some(Ok((
+                            spec.input_type == Some("password"),
+                            bridge.password_prev.get(&node_id).cloned(),
+                        ))),
+                        InteractionKind::Numeric { .. } => {
+                            let val = target.dyn_ref::<HtmlInputElement>()?.value().parse::<f64>().ok()?;
+                            Some(Err(val))
+                        }
+                        _ => None,
+                    }
+                })
+                .flatten();
+
+                match action {
+                    Some(Ok((is_pw, prev_pw))) => {
+                        event.stop_propagation();
+                        if is_composing {
+                            composing.borrow_mut().insert(node_id);
+                            return;
+                        }
+                        composing.borrow_mut().remove(&node_id);
+                        if let Some(new_val) = read_text_value(&target)
+                            && let Some(pw) = commit_text_value(
+                                &new_val,
+                                node_id,
+                                is_pw.then(|| prev_pw.as_deref().unwrap_or("")),
+                                &dom_owned,
+                                &queue,
+                                &wakeup,
+                            )
+                        {
+                            try_with_bridge_mut(id, |bridge| {
+                                bridge.password_prev.insert(node_id, pw);
+                            });
+                        }
+                    }
+                    Some(Err(val)) => {
+                        event.stop_propagation();
+                        push_action(&queue, &wakeup, set_numeric_value_action(node_id, val));
+                    }
+                    None => {}
+                }
+            })
+        {
+            self.viewport_listeners.push(l);
+        }
+
+        // 6. CompositionEnd delegation.
+        let queue = Arc::clone(&self.queue);
+        let wakeup = Rc::clone(&self.repaint_wakeup);
+        let dom_owned = Rc::clone(&self.dom_owned_selection);
+        let composing = Rc::clone(&self.composing_nodes);
+        if let Some(l) = add_listener_with_options(
+            &container_target,
+            "compositionend",
+            false,
+            true,
+            move |event| {
+                let Some((target, node_id)) = event_node_target(&event) else {
+                    return;
+                };
+                let text_info = try_with_bridge_mut(id, |bridge| {
+                    let spec = bridge.tree.spec(node_id)?;
+                    if InteractionKind::from_spec(spec) == InteractionKind::Text && !spec.read_only
+                    {
+                        Some((
+                            spec.input_type == Some("password"),
+                            bridge.password_prev.get(&node_id).cloned(),
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .flatten();
+                if let Some((is_pw, prev_pw)) = text_info {
+                    event.stop_propagation();
+                    composing.borrow_mut().remove(&node_id);
+                    if let Some(new_val) = read_text_value(&target)
+                        && let Some(pw) = commit_text_value(
+                            &new_val,
+                            node_id,
+                            is_pw.then(|| prev_pw.as_deref().unwrap_or("")),
+                            &dom_owned,
+                            &queue,
+                            &wakeup,
+                        )
+                    {
+                        try_with_bridge_mut(id, |bridge| {
+                            bridge.password_prev.insert(node_id, pw);
+                        });
+                    }
+                }
+            },
+        ) {
+            self.viewport_listeners.push(l);
+        }
+
+        // 7. Select delegation (capture catches non-bubbling synthetic events too).
+        let syncing_selection = Rc::clone(&self.syncing_selection);
+        let queue = Arc::clone(&self.queue);
+        let wakeup = Rc::clone(&self.repaint_wakeup);
+        if let Some(l) =
+            add_listener_with_options(&container_target, "select", true, true, move |event| {
+                if syncing_selection.get() {
+                    return;
+                }
+                let Some((target, node_id)) = event_node_target(&event) else {
+                    return;
+                };
+                let ok = try_with_bridge_mut(id, |bridge| {
+                    bridge.tree.spec(node_id).is_some_and(|s| {
+                        InteractionKind::from_spec(s) == InteractionKind::Text
+                            && supports_dom_selection(s)
+                    })
+                })
+                .unwrap_or(false);
+                if ok {
+                    emit_dom_selection(&target, node_id, &syncing_selection, &queue, &wakeup);
+                }
+            })
+        {
+            self.viewport_listeners.push(l);
+        }
+
+        // 8. Keyup delegation (cursor movement selection sync).
+        let syncing_selection = Rc::clone(&self.syncing_selection);
+        let queue = Arc::clone(&self.queue);
+        let wakeup = Rc::clone(&self.repaint_wakeup);
+        if let Some(l) =
+            add_listener_with_options(&container_target, "keyup", false, true, move |event| {
+                let Some(kb) = event.dyn_ref::<KeyboardEvent>() else {
+                    return;
+                };
+                if kb.is_composing()
+                    || !matches!(
+                        kb.key().as_str(),
+                        "ArrowLeft" | "ArrowRight" | "ArrowUp" | "ArrowDown" | "Home" | "End"
+                    )
+                {
+                    return;
+                }
+                let Some((target, node_id)) = event_node_target(&event) else {
+                    return;
+                };
+                let ok = try_with_bridge_mut(id, |bridge| {
+                    bridge.tree.spec(node_id).is_some_and(|s| {
+                        InteractionKind::from_spec(s) == InteractionKind::Text
+                            && supports_dom_selection(s)
+                    })
+                })
+                .unwrap_or(false);
+                if ok {
+                    emit_dom_selection(&target, node_id, &syncing_selection, &queue, &wakeup);
+                }
+            })
+        {
+            self.viewport_listeners.push(l);
+        }
+
+        // 9. Keydown delegation (Escape/Enter forwarding, PageUp/PageDown scrolling, slider stepping, click keys).
         let queue = Arc::clone(&self.queue);
         let wakeup = Rc::clone(&self.repaint_wakeup);
         if let Some(l) = add_listener(&container_target, "keydown", move |event| {
             let Some(kb) = event.dyn_ref::<KeyboardEvent>() else {
                 return;
             };
-            let action = match kb.key().as_str() {
-                "PageDown" => Action::ScrollDown,
-                "PageUp" => Action::ScrollUp,
-                _ => return,
-            };
-            let Some(target) = event.target().and_then(|t| t.dyn_into::<Element>().ok()) else {
-                return;
-            };
-            if target.tag_name().eq_ignore_ascii_case("TEXTAREA") {
+            let key = kb.key();
+            if key == "Escape" && !kb.is_composing() {
+                event.stop_propagation();
+                push_events(
+                    &queue,
+                    &wakeup,
+                    [PendingDomEvent::KeyPress(egui::Key::Escape)],
+                );
                 return;
             }
-            let Some(raw_id) = target.get_attribute("data-accesskit-id") else {
+            let Some((target, node_id)) = event_node_target(&event) else {
                 return;
             };
-            let Ok(node_id) = raw_id.parse::<u64>().map(NodeId) else {
+            match key.as_str() {
+                "PageDown" | "PageUp" if !target.tag_name().eq_ignore_ascii_case("TEXTAREA") => {
+                    event.prevent_default();
+                    event.stop_propagation();
+                    let action = if key == "PageDown" {
+                        Action::ScrollDown
+                    } else {
+                        Action::ScrollUp
+                    };
+                    push_action(&queue, &wakeup, scroll_action(node_id, action));
+                    return;
+                }
+                _ => {}
+            }
+            let info = try_with_bridge_mut(id, |bridge| {
+                bridge
+                    .tree
+                    .spec(node_id)
+                    .map(|s| (InteractionKind::from_spec(s), s.tag))
+            })
+            .flatten();
+            let Some((kind, tag)) = info else {
                 return;
             };
-            event.prevent_default();
-            event.stop_propagation();
-            push_action(&queue, &wakeup, scroll_action(node_id, action));
+            match kind {
+                InteractionKind::Click => {
+                    if !matches!(tag, DomTag::Button | DomTag::Anchor | DomTag::Input)
+                        && matches!(key.as_str(), "Enter" | " ")
+                    {
+                        event.prevent_default();
+                        event.stop_propagation();
+                        push_action(&queue, &wakeup, click_action(node_id));
+                    }
+                }
+                InteractionKind::Text => {
+                    if key == "Enter"
+                        && tag == DomTag::Input
+                        && !kb.is_composing()
+                        && !kb.shift_key()
+                        && !kb.ctrl_key()
+                        && !kb.alt_key()
+                        && !kb.meta_key()
+                    {
+                        event.stop_propagation();
+                        push_events(
+                            &queue,
+                            &wakeup,
+                            [PendingDomEvent::KeyPress(egui::Key::Enter)],
+                        );
+                    } else if kb.is_composing() || key != "Tab" {
+                        event.stop_propagation();
+                    }
+                }
+                InteractionKind::Numeric { unstepped } => {
+                    if unstepped {
+                        match key.as_str() {
+                            "ArrowRight" | "ArrowUp" => {
+                                event.prevent_default();
+                                event.stop_propagation();
+                                push_action(&queue, &wakeup, increment_action(node_id));
+                                return;
+                            }
+                            "ArrowLeft" | "ArrowDown" => {
+                                event.prevent_default();
+                                event.stop_propagation();
+                                push_action(&queue, &wakeup, decrement_action(node_id));
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if key.starts_with("Arrow") || key == "Home" || key == "End" {
+                        event.stop_propagation();
+                    }
+                }
+                InteractionKind::None => {}
+            }
         }) {
             self.viewport_listeners.push(l);
         }
@@ -531,30 +1017,35 @@ impl WebDomBridge {
     }
 
     pub(crate) fn apply_update(&mut self, update: egui::accesskit::TreeUpdate) {
+        if !self.activated {
+            return;
+        }
         let prev_focused_id = active_element_for(self.container.as_ref(), &self.document)
             .filter(|active| self.container.contains(Some(active.as_ref())))
-            .and_then(|el| el.get_attribute("data-accesskit-id"))
-            .and_then(|raw| raw.parse::<u64>().ok())
-            .map(NodeId);
+            .and_then(|el| parse_node_id(&el));
 
         let (scale, scale_changed) = self.sync_viewport();
-        let ops = self.tree.apply_update_diff(update);
-        let mut saw_focus_op = false;
+        let TreeDelta {
+            upserts,
+            children_ops,
+            removals,
+            focus_change,
+        } = self.tree.apply_update_diff(update);
 
-        for op in ops {
-            match op {
-                BridgeOp::Upsert { old, spec } => {
-                    self.upsert_node(old.as_ref(), spec, scale);
-                }
-                BridgeOp::SetChildren { parent, children } => self.set_children(parent, &children),
-                BridgeOp::Remove(id) => self.remove_node(id),
-                BridgeOp::SetFocus(target) => {
-                    saw_focus_op = true;
-                    if self.has_dom_focus() || self.dom_action_in_flight {
-                        self.set_focus(target);
-                    }
-                }
-            }
+        for (old, spec) in upserts {
+            self.upsert_node(old.as_ref(), spec, scale);
+        }
+        for (parent, children) in children_ops {
+            self.set_children(parent, &children);
+        }
+        for id in removals {
+            self.remove_node(id);
+        }
+        let saw_focus_op = focus_change.is_some();
+        if let Some(target) = focus_change
+            && (self.has_dom_focus() || self.dom_action_in_flight)
+        {
+            self.set_focus(target);
         }
 
         // Reparenting a focused element into a newly created ancestor <div> blurs it in
@@ -589,6 +1080,7 @@ impl WebDomBridge {
     }
 
     pub(crate) fn realign_viewport(&mut self) {
+        self.viewport_dirty = true;
         let (scale, scale_changed) = self.sync_viewport();
         if scale_changed {
             self.reapply_all_bounds(scale);
@@ -596,13 +1088,19 @@ impl WebDomBridge {
     }
 
     pub(crate) fn destroy(&mut self) {
+        self.activate_cb = None;
+        if let Some(btn) = self.activate_button.take() {
+            btn.remove();
+        }
         *self.repaint_wakeup.borrow_mut() = None;
         self.resize_observer = None;
         self.viewport_listeners.clear();
-        self.listeners.clear();
         self.clear_modal_inert();
+        self.modal_nodes.clear();
+        self.modal_dirty = false;
         self.dom_owned_selection.borrow_mut().clear();
         self.composing_nodes.borrow_mut().clear();
+        self.password_prev.clear();
         self.pending_text_reconcile.clear();
         self.hoisted_children.clear();
         self.elements.clear();
@@ -639,6 +1137,10 @@ impl WebDomBridge {
     }
 
     fn sync_modal_inert(&mut self) {
+        if !self.modal_dirty {
+            return;
+        }
+        self.modal_dirty = false;
         self.clear_modal_inert();
         let Some(modal_el) = self.find_top_modal_element() else {
             return;
@@ -663,6 +1165,17 @@ impl WebDomBridge {
     }
 
     fn find_top_modal_element(&self) -> Option<Element> {
+        if self.modal_nodes.is_empty() {
+            return None;
+        }
+        if self.modal_nodes.len() == 1 {
+            let modal_id = *self.modal_nodes.iter().next()?;
+            return self
+                .elements
+                .get(&modal_id)
+                .filter(|el| self.container.contains(Some(el.as_ref())))
+                .cloned();
+        }
         let mut stack = Vec::new();
         let mut child = self.container.first_element_child();
         while let Some(el) = child {
@@ -670,13 +1183,7 @@ impl WebDomBridge {
             stack.push(el);
         }
         while let Some(el) = stack.pop() {
-            if el
-                .get_attribute("data-accesskit-id")
-                .and_then(|raw| raw.parse::<u64>().ok())
-                .map(NodeId)
-                .and_then(|id| self.tree.spec(id))
-                .is_some_and(|s| s.modal && !s.disabled)
-            {
+            if parse_node_id(&el).is_some_and(|id| self.modal_nodes.contains(&id)) {
                 return Some(el);
             }
             let mut c = el.first_element_child();
@@ -688,21 +1195,40 @@ impl WebDomBridge {
         None
     }
 
-    fn reapply_all_bounds(&self, scale: (f64, f64)) {
+    fn reapply_all_bounds(&mut self, scale: (f64, f64)) {
         for (id, element) in &self.elements {
             if let Some(spec) = self.tree.spec(*id) {
-                apply_bounds(element, spec.bounds, scale);
+                apply_bounds(element, None, spec.bounds, scale, &mut self.bounds_buf);
             }
         }
     }
 
     fn sync_viewport(&mut self) -> ((f64, f64), bool) {
+        if !self.activated {
+            return (self.last_scale.unwrap_or((1.0, 1.0)), false);
+        }
         let raw_dpr = self.window.device_pixel_ratio();
         let dpr = if raw_dpr > 0.0 && raw_dpr.is_finite() {
             raw_dpr
         } else {
             1.0
         };
+        let buf_size = self
+            .canvas
+            .as_ref()
+            .and_then(|c| c.dyn_ref::<HtmlCanvasElement>())
+            .map_or((0, 0), |c| (c.width(), c.height()));
+
+        if !self.viewport_dirty
+            && self.last_dpr == dpr
+            && self.last_buf_size == buf_size
+            && let Some(scale) = self.last_scale
+        {
+            return (scale, false);
+        }
+        self.viewport_dirty = false;
+        self.last_dpr = dpr;
+        self.last_buf_size = buf_size;
 
         let next_scale = if let Some(canvas) = &self.canvas {
             let rect = canvas.get_bounding_client_rect();
@@ -745,20 +1271,18 @@ impl WebDomBridge {
                 if let Some(html) = self.container.dyn_ref::<HtmlElement>() {
                     let style = html.style();
                     if prev.is_none_or(|p| p.0 != origin_x || p.1 != origin_y) {
-                        let _ = style.set_property("left", &format!("{origin_x}px"));
-                        let _ = style.set_property("top", &format!("{origin_y}px"));
+                        let _ = set_px(&style, &mut self.bounds_buf, "left", origin_x);
+                        let _ = set_px(&style, &mut self.bounds_buf, "top", origin_y);
                     }
                     if prev.is_none_or(|p| p.2 != content_w || p.3 != content_h) {
-                        let _ = style.set_property("width", &format!("{content_w}px"));
-                        let _ = style.set_property("height", &format!("{content_h}px"));
+                        let _ = set_px(&style, &mut self.bounds_buf, "width", content_w);
+                        let _ = set_px(&style, &mut self.bounds_buf, "height", content_h);
                     }
                 }
             }
 
-            let (buf_w, buf_h) = canvas
-                .dyn_ref::<HtmlCanvasElement>()
-                .map(|c| (f64::from(c.width()), f64::from(c.height())))
-                .unwrap_or((0.0, 0.0));
+            let buf_w = f64::from(buf_size.0);
+            let buf_h = f64::from(buf_size.1);
             let scale_x = if buf_w > 0.0 && content_w > 0.0 {
                 content_w / buf_w
             } else {
@@ -786,17 +1310,20 @@ impl WebDomBridge {
         scale: (f64, f64),
     ) {
         let id = spec.id;
+        let is_active_modal = spec.modal && !spec.disabled;
+        if is_active_modal {
+            if self.modal_nodes.insert(id) {
+                self.modal_dirty = true;
+            }
+        } else if self.modal_nodes.remove(&id) {
+            self.modal_dirty = true;
+        }
+        if spec.input_type != Some("password") {
+            self.password_prev.remove(&id);
+        }
+
         let desired_tag = element_tag_name(&spec);
         let tag_changed = old_spec.is_some_and(|old| element_tag_name(old) != desired_tag);
-        let needs_rebind = old_spec.is_none_or(|old| {
-            element_tag_name(old) != desired_tag
-                || old.aria_role != spec.aria_role
-                || old.input_type != spec.input_type
-                || InteractionKind::from_spec(old) != InteractionKind::from_spec(&spec)
-                || old.focusable != spec.focusable
-                || old.disabled != spec.disabled
-                || old.read_only != spec.read_only
-        });
 
         let created = tag_changed || !self.elements.contains_key(&id);
         let element = if created {
@@ -833,11 +1360,19 @@ impl WebDomBridge {
             &element,
             attr_old,
             &spec,
-            scale,
             skip_text_sync,
             self.hoisted_children.get(&id).map(Vec::as_slice),
             self.bridge_id,
         );
+        if attr_old.is_none_or(|o| o.bounds != spec.bounds) {
+            apply_bounds(
+                &element,
+                attr_old.and_then(|o| o.bounds),
+                spec.bounds,
+                scale,
+                &mut self.bounds_buf,
+            );
+        }
 
         let dom_owned = if !skip_text_sync {
             self.dom_owned_selection.borrow_mut().remove(&id)
@@ -869,244 +1404,12 @@ impl WebDomBridge {
         if Some(id) == self.tree.root_id() && element.parent_node().is_none() {
             let _ = self.container.append_child(&element);
         }
-
-        if created || needs_rebind {
-            self.listeners.remove(&id);
-            let attached = self.attach_listeners(&element, &spec);
-            if !attached.is_empty() {
-                self.listeners.insert(id, attached);
-            }
-        }
-    }
-
-    fn attach_listeners(&self, element: &Element, spec: &DomNodeSpec) -> Vec<AttachedListener> {
-        let mut out = Vec::new();
-        let target: web_sys::EventTarget = element.clone().into();
-        let id = spec.id;
-
-        match InteractionKind::from_spec(spec) {
-            InteractionKind::Click => {
-                let queue = Arc::clone(&self.queue);
-                let wakeup = Rc::clone(&self.repaint_wakeup);
-                let is_anchor = spec.tag == DomTag::Anchor;
-                if let Some(l) = add_listener(&target, "click", move |event| {
-                    if is_anchor {
-                        event.prevent_default();
-                    }
-                    event.stop_propagation();
-                    push_action(&queue, &wakeup, click_action(id));
-                }) {
-                    out.push(l);
-                }
-                if !matches!(spec.tag, DomTag::Button | DomTag::Anchor | DomTag::Input) {
-                    let queue = Arc::clone(&self.queue);
-                    let wakeup = Rc::clone(&self.repaint_wakeup);
-                    if let Some(l) = add_listener(&target, "keydown", move |event| {
-                        if let Some(kb) = event.dyn_ref::<KeyboardEvent>()
-                            && matches!(kb.key().as_str(), "Enter" | " ")
-                        {
-                            event.prevent_default();
-                            event.stop_propagation();
-                            push_action(&queue, &wakeup, click_action(id));
-                        }
-                    }) {
-                        out.push(l);
-                    }
-                }
-            }
-            InteractionKind::Text => {
-                if !spec.read_only {
-                    let is_password = spec.input_type == Some("password");
-                    let prev_val = is_password.then(|| {
-                        Rc::new(RefCell::new(
-                            read_text_value(element).unwrap_or_default(),
-                        ))
-                    });
-                    if let Some(prev_pw) = prev_val.as_ref() {
-                        for event_name in ["focus", "beforeinput"] {
-                            let el_snap = element.clone();
-                            let prev_snap = Rc::clone(prev_pw);
-                            if let Some(l) = add_listener(&target, event_name, move |_event| {
-                                if let Some(val) = read_text_value(&el_snap) {
-                                    *prev_snap.borrow_mut() = val;
-                                }
-                            }) {
-                                out.push(l);
-                            }
-                        }
-                    }
-
-                    let composing = Rc::clone(&self.composing_nodes);
-                    if let Some(l) = add_listener(&target, "compositionstart", move |event| {
-                        event.stop_propagation();
-                        composing.borrow_mut().insert(id);
-                    }) {
-                        out.push(l);
-                    }
-
-                    let el_input = element.clone();
-                    let queue_input = Arc::clone(&self.queue);
-                    let wakeup_input = Rc::clone(&self.repaint_wakeup);
-                    let owned_input = Rc::clone(&self.dom_owned_selection);
-                    let composing_input = Rc::clone(&self.composing_nodes);
-                    let prev_input = prev_val.clone();
-                    if let Some(l) = add_listener(&target, "input", move |event| {
-                        event.stop_propagation();
-                        if event
-                            .dyn_ref::<InputEvent>()
-                            .is_some_and(|ie| ie.is_composing())
-                        {
-                            composing_input.borrow_mut().insert(id);
-                            return;
-                        }
-                        composing_input.borrow_mut().remove(&id);
-                        commit_text_value(
-                            &el_input,
-                            id,
-                            prev_input.as_deref(),
-                            &owned_input,
-                            &queue_input,
-                            &wakeup_input,
-                        );
-                    }) {
-                        out.push(l);
-                    }
-
-                    let el_comp = element.clone();
-                    let queue_comp = Arc::clone(&self.queue);
-                    let wakeup_comp = Rc::clone(&self.repaint_wakeup);
-                    let owned_comp = Rc::clone(&self.dom_owned_selection);
-                    let composing_end = Rc::clone(&self.composing_nodes);
-                    if let Some(l) = add_listener(&target, "compositionend", move |event| {
-                        event.stop_propagation();
-                        composing_end.borrow_mut().remove(&id);
-                        commit_text_value(
-                            &el_comp,
-                            id,
-                            prev_val.as_deref(),
-                            &owned_comp,
-                            &queue_comp,
-                            &wakeup_comp,
-                        );
-                    }) {
-                        out.push(l);
-                    }
-                }
-                if let Some(l) = add_listener(&target, "keydown", |event| {
-                    if let Some(kb) = event.dyn_ref::<KeyboardEvent>() {
-                        let key = kb.key();
-                        if kb.is_composing() || (key != "Tab" && key != "Escape") {
-                            event.stop_propagation();
-                        }
-                    }
-                }) {
-                    out.push(l);
-                }
-                if supports_dom_selection(spec) {
-                    let el_for_select = element.clone();
-                    let queue = Arc::clone(&self.queue);
-                    let wakeup = Rc::clone(&self.repaint_wakeup);
-                    let syncing = Rc::clone(&self.syncing_selection);
-                    if let Some(l) = add_listener(&target, "select", move |_event| {
-                        emit_dom_selection(&el_for_select, id, &syncing, &queue, &wakeup);
-                    }) {
-                        out.push(l);
-                    }
-
-                    let el_for_keyup = element.clone();
-                    let queue = Arc::clone(&self.queue);
-                    let wakeup = Rc::clone(&self.repaint_wakeup);
-                    let syncing = Rc::clone(&self.syncing_selection);
-                    if let Some(l) = add_listener(&target, "keyup", move |event| {
-                        if let Some(kb) = event.dyn_ref::<KeyboardEvent>()
-                            && !kb.is_composing()
-                            && matches!(
-                                kb.key().as_str(),
-                                "ArrowLeft"
-                                    | "ArrowRight"
-                                    | "ArrowUp"
-                                    | "ArrowDown"
-                                    | "Home"
-                                    | "End"
-                            )
-                        {
-                            emit_dom_selection(&el_for_keyup, id, &syncing, &queue, &wakeup);
-                        }
-                    }) {
-                        out.push(l);
-                    }
-                }
-            }
-            InteractionKind::Numeric { unstepped } => {
-                if let Some(input_el) = element.dyn_ref::<HtmlInputElement>().cloned() {
-                    let queue = Arc::clone(&self.queue);
-                    let wakeup = Rc::clone(&self.repaint_wakeup);
-                    if let Some(l) = add_listener(&target, "input", move |event| {
-                        event.stop_propagation();
-                        if let Ok(val) = input_el.value().parse::<f64>() {
-                            push_action(&queue, &wakeup, set_numeric_value_action(id, val));
-                        }
-                    }) {
-                        out.push(l);
-                    }
-                }
-                let queue = Arc::clone(&self.queue);
-                let wakeup = Rc::clone(&self.repaint_wakeup);
-                if let Some(l) = add_listener(&target, "keydown", move |event| {
-                    if let Some(kb) = event.dyn_ref::<KeyboardEvent>() {
-                        let key = kb.key();
-                        if unstepped {
-                            match key.as_str() {
-                                "ArrowRight" | "ArrowUp" => {
-                                    event.prevent_default();
-                                    event.stop_propagation();
-                                    push_action(&queue, &wakeup, increment_action(id));
-                                    return;
-                                }
-                                "ArrowLeft" | "ArrowDown" => {
-                                    event.prevent_default();
-                                    event.stop_propagation();
-                                    push_action(&queue, &wakeup, decrement_action(id));
-                                    return;
-                                }
-                                _ => {}
-                            }
-                        }
-                        if key.starts_with("Arrow") || key == "Home" || key == "End" {
-                            event.stop_propagation();
-                        }
-                    }
-                }) {
-                    out.push(l);
-                }
-            }
-            InteractionKind::None => {}
-        }
-
-        if spec.focusable && !spec.disabled && Some(id) != self.tree.root_id() {
-            let queue = Arc::clone(&self.queue);
-            let wakeup = Rc::clone(&self.repaint_wakeup);
-            let syncing_focus = Rc::clone(&self.syncing_focus);
-            if let Some(l) = add_listener(&target, "focus", move |_event| {
-                if !syncing_focus.get() {
-                    push_events(
-                        &queue,
-                        &wakeup,
-                        [
-                            PendingDomEvent::Action(focus_action(id)),
-                            PendingDomEvent::Action(scroll_into_view_action(id)),
-                        ],
-                    );
-                }
-            }) {
-                out.push(l);
-            }
-        }
-
-        out
     }
 
     fn set_children(&mut self, parent: NodeId, children: &[NodeId]) {
+        if !self.modal_nodes.is_empty() {
+            self.modal_dirty = true;
+        }
         let Some(parent_el) = self.elements.get(&parent).cloned() else {
             return;
         };
@@ -1182,7 +1485,10 @@ impl WebDomBridge {
     }
 
     fn remove_node(&mut self, id: NodeId) {
-        self.listeners.remove(&id);
+        if self.modal_nodes.remove(&id) {
+            self.modal_dirty = true;
+        }
+        self.password_prev.remove(&id);
         self.dom_owned_selection.borrow_mut().remove(&id);
         self.composing_nodes.borrow_mut().remove(&id);
         self.pending_text_reconcile.remove(&id);
@@ -1257,36 +1563,30 @@ impl WebDomBridge {
 }
 
 fn commit_text_value(
-    element: &Element,
+    new_val: &str,
     id: NodeId,
-    prev_pw: Option<&RefCell<String>>,
+    prev_pw: Option<&str>,
     owned_selection: &RefCell<HashSet<NodeId>>,
     queue: &ActionQueue,
     wakeup: &RepaintWakeup,
-) {
-    let Some(new_val) = read_text_value(element) else {
-        return;
-    };
-    if let Some(prev_pw) = prev_pw {
-        let mut prev = prev_pw.borrow_mut();
-        if new_val.chars().any(is_password_mask_char) {
-            let (anchor_utf16, focus_utf16, inserted) = password_diff_utf16(&prev, &new_val);
-            *prev = new_val;
-            push_text_event(
-                queue,
-                wakeup,
-                id,
-                PendingDomEvent::ReplaceRange {
-                    target_node: id,
-                    anchor_utf16,
-                    focus_utf16,
-                    text: inserted,
-                },
-                false,
-            );
-            return;
-        }
-        *prev = new_val.clone();
+) -> Option<String> {
+    if let Some(prev) = prev_pw
+        && new_val.chars().any(is_password_mask_char)
+    {
+        let (anchor_utf16, focus_utf16, inserted) = password_diff_utf16(prev, new_val);
+        push_text_event(
+            queue,
+            wakeup,
+            id,
+            PendingDomEvent::ReplaceRange {
+                target_node: id,
+                anchor_utf16,
+                focus_utf16,
+                text: inserted,
+            },
+            false,
+        );
+        return Some(new_val.to_owned());
     }
     owned_selection.borrow_mut().insert(id);
     push_text_event(
@@ -1295,10 +1595,35 @@ fn commit_text_value(
         id,
         PendingDomEvent::SetValue {
             target_node: id,
-            value: new_val,
+            value: new_val.to_owned(),
         },
         true,
     );
+    prev_pw.map(|_| new_val.to_owned())
+}
+
+fn parse_node_id(element: &Element) -> Option<NodeId> {
+    element
+        .get_attribute("data-accesskit-id")
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(NodeId)
+}
+
+fn event_node_target(event: &Event) -> Option<(Element, NodeId)> {
+    let target = event.target()?.dyn_into::<Element>().ok()?;
+    let node_id = parse_node_id(&target)?;
+    Some((target, node_id))
+}
+
+fn set_px(
+    style: &web_sys::CssStyleDeclaration,
+    buf: &mut String,
+    prop: &str,
+    val: f64,
+) -> Result<(), wasm_bindgen::JsValue> {
+    buf.clear();
+    let _ = write!(buf, "{val}px");
+    style.set_property(prop, buf)
 }
 
 fn active_element_for(node: &web_sys::Node, document: &Document) -> Option<Element> {
@@ -1432,12 +1757,13 @@ fn queue_text_selection(
     let pushed = if let Ok(mut guard) = queue.lock() {
         if guard
             .iter()
-            .any(|ev| ev.target_node() == id && ev.is_text_mutation())
+            .any(|ev| ev.target_node() == Some(id) && ev.is_text_mutation())
         {
             false
         } else {
             guard.retain(|ev| {
-                !(ev.target_node() == id && matches!(ev, PendingDomEvent::TextSelection { .. }))
+                !(ev.target_node() == Some(id)
+                    && matches!(ev, PendingDomEvent::TextSelection { .. }))
             });
             guard.push(PendingDomEvent::TextSelection {
                 target_node: id,
@@ -1466,7 +1792,8 @@ fn push_text_event(
             guard.retain(|ev| !ev.targets_text_state(id));
         } else {
             guard.retain(|ev| {
-                !(ev.target_node() == id && matches!(ev, PendingDomEvent::TextSelection { .. }))
+                !(ev.target_node() == Some(id)
+                    && matches!(ev, PendingDomEvent::TextSelection { .. }))
             });
         }
         guard.push(event);
@@ -1596,7 +1923,6 @@ fn apply_dom_attributes(
     element: &Element,
     old: Option<&DomNodeSpec>,
     spec: &DomNodeSpec,
-    scale: (f64, f64),
     skip_value_sync: bool,
     hoisted: Option<&[NodeId]>,
     bridge_id: u64,
@@ -1680,6 +2006,81 @@ fn apply_dom_attributes(
             "aria-multiline",
             (spec.tag == DomTag::TextArea).then_some("true"),
         );
+    }
+    if old.is_none_or(|o| o.required != spec.required) {
+        set_optional_attr(element, "aria-required", spec.required.then_some("true"));
+    }
+    if old.is_none_or(|o| o.invalid != spec.invalid) {
+        let invalid = spec.invalid.map(|inv| match inv {
+            Invalid::True => "true",
+            Invalid::Grammar => "grammar",
+            Invalid::Spelling => "spelling",
+        });
+        set_optional_attr(element, "aria-invalid", invalid);
+    }
+    if old.is_none_or(|o| o.error_message != spec.error_message) {
+        let err_id = spec.error_message.map(|id| dom_element_id(bridge_id, id));
+        set_optional_attr(element, "aria-errormessage", err_id.as_deref());
+    }
+    if old.is_none_or(|o| o.described_by != spec.described_by) {
+        if spec.described_by.is_empty() {
+            let _ = element.remove_attribute("aria-describedby");
+        } else {
+            let mut ids = String::new();
+            for (i, id) in spec.described_by.iter().enumerate() {
+                if i > 0 {
+                    ids.push(' ');
+                }
+                let _ = write!(ids, "{}", dom_element_id(bridge_id, *id));
+            }
+            let _ = element.set_attribute("aria-describedby", &ids);
+        }
+    }
+    if old.is_none_or(|o| o.active_descendant != spec.active_descendant) {
+        let active_id = spec
+            .active_descendant
+            .map(|id| dom_element_id(bridge_id, id));
+        set_optional_attr(element, "aria-activedescendant", active_id.as_deref());
+    }
+    if old.is_none_or(|o| o.orientation != spec.orientation) {
+        let orientation = spec.orientation.map(|o| match o {
+            Orientation::Horizontal => "horizontal",
+            Orientation::Vertical => "vertical",
+        });
+        set_optional_attr(element, "aria-orientation", orientation);
+    }
+    if old.is_none_or(|o| o.position_in_set != spec.position_in_set) {
+        let pos = spec
+            .position_in_set
+            .and_then(|p| p.checked_add(1))
+            .map(|p| p.to_string());
+        set_optional_attr(element, "aria-posinset", pos.as_deref());
+    }
+    if old.is_none_or(|o| o.size_of_set != spec.size_of_set) {
+        let size = spec.size_of_set.map(|s| s.to_string());
+        set_optional_attr(element, "aria-setsize", size.as_deref());
+    }
+    if old.is_none_or(|o| o.row_count != spec.row_count) {
+        let count = spec.row_count.map(|c| c.to_string());
+        set_optional_attr(element, "aria-rowcount", count.as_deref());
+    }
+    if old.is_none_or(|o| o.column_count != spec.column_count) {
+        let count = spec.column_count.map(|c| c.to_string());
+        set_optional_attr(element, "aria-colcount", count.as_deref());
+    }
+    if old.is_none_or(|o| o.row_index != spec.row_index) {
+        let idx = spec
+            .row_index
+            .and_then(|r| r.checked_add(1))
+            .map(|r| r.to_string());
+        set_optional_attr(element, "aria-rowindex", idx.as_deref());
+    }
+    if old.is_none_or(|o| o.column_index != spec.column_index) {
+        let idx = spec
+            .column_index
+            .and_then(|c| c.checked_add(1))
+            .map(|c| c.to_string());
+        set_optional_attr(element, "aria-colindex", idx.as_deref());
     }
 
     if old.is_none_or(|o| o.input_type != spec.input_type || o.tag != spec.tag) {
@@ -1913,27 +2314,33 @@ fn apply_dom_attributes(
             element.set_text_content(Some(text));
         }
     }
-
-    if old.is_none_or(|o| o.bounds != spec.bounds) {
-        apply_bounds(element, spec.bounds, scale);
-    }
 }
 
-fn apply_bounds(element: &Element, bounds: Option<Rect>, scale: (f64, f64)) {
+fn apply_bounds(
+    element: &Element,
+    old_bounds: Option<Rect>,
+    bounds: Option<Rect>,
+    scale: (f64, f64),
+    buf: &mut String,
+) {
     let Some(html) = element.dyn_ref::<HtmlElement>() else {
         return;
     };
     let style = html.style();
     if let Some(bounds) = bounds {
-        let left = bounds.x0 * scale.0;
-        let top = bounds.y0 * scale.1;
-        let width = (bounds.x1 - bounds.x0).max(0.0) * scale.0;
-        let height = (bounds.y1 - bounds.y0).max(0.0) * scale.1;
-        let _ = style.set_property("position", "absolute");
-        let _ = style.set_property("left", &format!("{left}px"));
-        let _ = style.set_property("top", &format!("{top}px"));
-        let _ = style.set_property("width", &format!("{width}px"));
-        let _ = style.set_property("height", &format!("{height}px"));
+        if old_bounds.is_none() {
+            let _ = style.set_property("position", "absolute");
+        }
+        if old_bounds.is_none_or(|o| o.x0 != bounds.x0 || o.y0 != bounds.y0) {
+            let _ = set_px(&style, buf, "left", bounds.x0 * scale.0);
+            let _ = set_px(&style, buf, "top", bounds.y0 * scale.1);
+        }
+        let w = bounds.x1 - bounds.x0;
+        let h = bounds.y1 - bounds.y0;
+        if old_bounds.is_none_or(|o| (o.x1 - o.x0) != w || (o.y1 - o.y0) != h) {
+            let _ = set_px(&style, buf, "width", w.max(0.0) * scale.0);
+            let _ = set_px(&style, buf, "height", h.max(0.0) * scale.1);
+        }
     } else {
         let _ = style.remove_property("position");
         let _ = style.remove_property("left");

@@ -59,6 +59,10 @@ pub struct WebAccessKitConfig {
     /// HTML `id` of the `<canvas>` hosting the `egui` surface.
     /// When empty (or not found), the first `<canvas>` in the document is used.
     pub canvas_id: String,
+    /// Defer AccessKit tree construction and DOM mirroring until a screen reader
+    /// user interacts with the activation control or [`WebAccessKitPlugin::activate`]
+    /// is called. Defaults to `false` (eager mirroring).
+    pub lazy: bool,
 }
 
 impl WebAccessKitConfig {
@@ -66,7 +70,15 @@ impl WebAccessKitConfig {
     pub fn new(canvas_id: impl Into<String>) -> Self {
         Self {
             canvas_id: canvas_id.into(),
+            lazy: false,
         }
+    }
+
+    /// Sets whether AccessKit tree construction is deferred until first AT interaction
+    /// or an explicit [`WebAccessKitPlugin::activate`] call.
+    pub fn with_lazy(mut self, lazy: bool) -> Self {
+        self.lazy = lazy;
+        self
     }
 }
 
@@ -103,6 +115,14 @@ impl WebAccessKitPlugin {
         Self::with_config(WebAccessKitConfig::new(canvas_id))
     }
 
+    /// Creates a lazily activated plugin targeting the `<canvas>` with `canvas_id`.
+    ///
+    /// No AccessKit updates or semantic DOM nodes are built until an assistive-tech
+    /// user activates the fallback control or [`Self::activate`] is called.
+    pub fn new_lazy(canvas_id: impl Into<String>) -> Self {
+        Self::with_config(WebAccessKitConfig::new(canvas_id).with_lazy(true))
+    }
+
     /// Creates a plugin from an explicit [`WebAccessKitConfig`].
     pub fn with_config(config: WebAccessKitConfig) -> Self {
         Self {
@@ -119,6 +139,19 @@ impl WebAccessKitPlugin {
         let plugin = Self::new(canvas.id());
         dom::stash_pending_canvas(plugin.bridge_id, canvas);
         plugin
+    }
+
+    /// Programmatically enables AccessKit mirroring when configured with `lazy: true`.
+    ///
+    /// Safe to call repeatedly or when already active.
+    pub fn activate(ctx: &egui::Context) {
+        #[cfg(target_arch = "wasm32")]
+        if let Some(plugin) = ctx.plugin_opt::<Self>() {
+            let bridge_id = plugin.lock().bridge_id;
+            dom::activate_bridge(bridge_id);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = ctx;
     }
 
     /// Tears down the DOM bridge and breaks the `Context` repaint-wakeup reference cycle.
@@ -160,15 +193,24 @@ impl egui::Plugin for WebAccessKitPlugin {
 
     #[cfg(target_arch = "wasm32")]
     fn setup(&mut self, ctx: &egui::Context) {
-        ctx.enable_accesskit();
+        if !self.config.lazy {
+            ctx.enable_accesskit();
+        }
 
+        let activate_ctx = ctx.clone();
+        let activate = Box::new(move || {
+            activate_ctx.enable_accesskit();
+            activate_ctx.request_repaint();
+        });
         let wakeup_ctx = ctx.clone();
         let wakeup = Box::new(move || wakeup_ctx.request_repaint());
         if let Some(bridge) = dom::WebDomBridge::mount(
             self.bridge_id,
             &self.config.canvas_id,
+            self.config.lazy,
             Arc::clone(&self.queue),
             wakeup,
+            activate,
         ) {
             dom::insert_bridge(self.bridge_id, bridge);
             dom::install_viewport_listeners(self.bridge_id);

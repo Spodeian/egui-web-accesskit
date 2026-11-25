@@ -15,7 +15,7 @@ cargo install trunk
   ```sh
   trunk serve
   ```
-  Open `http://127.0.0.1:8080/` for the standard light-DOM `<canvas>` setup, or `http://127.0.0.1:8080/?shadow=1` to mount `<canvas>` inside an open `ShadowRoot` using `WebAccessKitPlugin::from_canvas`.
+  Open `http://127.0.0.1:8080/` for the standard light-DOM `<canvas>` setup, `http://127.0.0.1:8080/?shadow=1` to mount `<canvas>` inside an open `ShadowRoot` using `WebAccessKitPlugin::from_canvas`, or `http://127.0.0.1:8080/?lazy=1` to exercise deferred activation via `WebAccessKitPlugin::new_lazy`.
 
 - **Build static dist bundle (used by the E2E tests):**
   ```sh
