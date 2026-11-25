@@ -7,18 +7,29 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 use web_sys::{
     AddEventListenerOptions, Document, Element, Event, FocusOptions, HtmlCanvasElement,
-    HtmlElement, HtmlInputElement, HtmlTextAreaElement, KeyboardEvent, ShadowRoot, Window,
+    HtmlElement, HtmlInputElement, HtmlTextAreaElement, InputEvent, KeyboardEvent, ResizeObserver,
+    ShadowRoot, Window,
 };
 
-use egui::accesskit::{Action, ActionRequest, Live, NodeId, Rect, Toggled};
 use crate::mapper::{
-    DomNodeSpec, DomOp, DomTag, TreeBridge, click_action, decrement_action, focus_action,
+    BridgeOp, DomNodeSpec, DomTag, TreeBridge, click_action, decrement_action, focus_action,
     increment_action, replace_selected_text_action, scroll_action, scroll_into_view_action,
     set_numeric_value_action, set_value_action,
 };
+use egui::accesskit::{Action, ActionRequest, Live, NodeId, Rect, Toggled};
 
 pub(crate) enum PendingDomEvent {
     Action(ActionRequest),
+    SetValue {
+        target_node: NodeId,
+        value: String,
+    },
+    ReplaceRange {
+        target_node: NodeId,
+        anchor_utf16: usize,
+        focus_utf16: usize,
+        text: String,
+    },
     TextSelection {
         target_node: NodeId,
         anchor_utf16: usize,
@@ -30,16 +41,20 @@ impl PendingDomEvent {
     fn target_node(&self) -> NodeId {
         match self {
             Self::Action(req) => req.target_node,
-            Self::TextSelection { target_node, .. } => *target_node,
+            Self::SetValue { target_node, .. }
+            | Self::ReplaceRange { target_node, .. }
+            | Self::TextSelection { target_node, .. } => *target_node,
         }
     }
 
     fn is_text_mutation(&self) -> bool {
-        matches!(
-            self,
-            Self::Action(req)
-                if matches!(req.action, Action::SetValue | Action::ReplaceSelectedText)
-        )
+        match self {
+            Self::SetValue { .. } | Self::ReplaceRange { .. } => true,
+            Self::Action(req) => {
+                matches!(req.action, Action::SetValue | Action::ReplaceSelectedText)
+            }
+            Self::TextSelection { .. } => false,
+        }
     }
 
     fn targets_text_state(&self, node: NodeId) -> bool {
@@ -47,7 +62,7 @@ impl PendingDomEvent {
             return false;
         }
         match self {
-            Self::TextSelection { .. } => true,
+            Self::SetValue { .. } | Self::ReplaceRange { .. } | Self::TextSelection { .. } => true,
             Self::Action(req) => matches!(
                 req.action,
                 Action::SetValue | Action::ReplaceSelectedText | Action::SetTextSelection
@@ -84,7 +99,12 @@ pub(crate) fn install_viewport_listeners(id: u64) {
     with_bridge_mut(id, |bridge| bridge.install_viewport_listeners(id));
 }
 
-pub(crate) fn drain_pending_events(id: u64, queue: &ActionQueue, out: &mut Vec<egui::Event>) {
+pub(crate) fn drain_pending_events(
+    id: u64,
+    ctx: &egui::Context,
+    queue: &ActionQueue,
+    out: &mut Vec<egui::Event>,
+) {
     let drained = {
         let Ok(mut pending) = queue.lock() else {
             return;
@@ -95,26 +115,155 @@ pub(crate) fn drain_pending_events(id: u64, queue: &ActionQueue, out: &mut Vec<e
         pending.drain(..).collect::<Vec<_>>()
     };
 
-    for event in drained {
-        match event {
-            PendingDomEvent::Action(req) => out.push(egui::Event::AccessKitActionRequest(req)),
-            PendingDomEvent::TextSelection {
-                target_node,
-                anchor_utf16,
-                focus_utf16,
-            } => {
-                if let Some(req) = with_bridge_mut(id, |bridge| {
-                    bridge
-                        .tree
-                        .set_text_selection_action(target_node, anchor_utf16, focus_utf16)
-                })
-                .flatten()
-                {
+    let deferred = with_bridge_mut(id, |bridge| {
+        bridge.dom_action_in_flight = true;
+        let current_focus = bridge.tree.focused_id();
+        let mut focus_requested = HashSet::new();
+        let mut deferred = Vec::new();
+
+        for event in drained {
+            match event {
+                PendingDomEvent::Action(req) => {
+                    if req.action == Action::Focus {
+                        focus_requested.insert(req.target_node);
+                    }
                     out.push(egui::Event::AccessKitActionRequest(req));
+                }
+                PendingDomEvent::SetValue { target_node, value } => {
+                    if bridge.tree.supports_text_edit_actions(target_node) {
+                        bridge.pending_text_reconcile.insert(target_node);
+                        out.push(egui::Event::AccessKitActionRequest(set_value_action(
+                            target_node,
+                            value,
+                        )));
+                    } else if should_defer_for_focus(
+                        bridge,
+                        current_focus,
+                        target_node,
+                        &mut focus_requested,
+                        out,
+                    ) {
+                        deferred.push(PendingDomEvent::SetValue { target_node, value });
+                    } else {
+                        bridge.pending_text_reconcile.insert(target_node);
+                        out.extend(TreeBridge::fallback_set_value_events(value));
+                    }
+                }
+                PendingDomEvent::ReplaceRange {
+                    target_node,
+                    anchor_utf16,
+                    focus_utf16,
+                    text,
+                } => {
+                    if bridge.tree.supports_text_edit_actions(target_node) {
+                        if let Some(req) = bridge.tree.set_text_selection_action(
+                            target_node,
+                            anchor_utf16,
+                            focus_utf16,
+                        ) {
+                            out.push(egui::Event::AccessKitActionRequest(req));
+                        }
+                        bridge.pending_text_reconcile.insert(target_node);
+                        out.push(egui::Event::AccessKitActionRequest(
+                            replace_selected_text_action(target_node, text),
+                        ));
+                    } else if should_defer_for_focus(
+                        bridge,
+                        current_focus,
+                        target_node,
+                        &mut focus_requested,
+                        out,
+                    ) {
+                        deferred.push(PendingDomEvent::ReplaceRange {
+                            target_node,
+                            anchor_utf16,
+                            focus_utf16,
+                            text,
+                        });
+                    } else {
+                        bridge.pending_text_reconcile.insert(target_node);
+                        out.extend(bridge.tree.fallback_replace_range_events(
+                            target_node,
+                            anchor_utf16,
+                            focus_utf16,
+                            text,
+                        ));
+                    }
+                }
+                PendingDomEvent::TextSelection {
+                    target_node,
+                    anchor_utf16,
+                    focus_utf16,
+                } => {
+                    if !bridge.tree.supports_text_edit_actions(target_node)
+                        && should_defer_for_focus(
+                            bridge,
+                            current_focus,
+                            target_node,
+                            &mut focus_requested,
+                            out,
+                        )
+                    {
+                        deferred.push(PendingDomEvent::TextSelection {
+                            target_node,
+                            anchor_utf16,
+                            focus_utf16,
+                        });
+                    } else if let Some(req) = bridge.tree.set_text_selection_action(
+                        target_node,
+                        anchor_utf16,
+                        focus_utf16,
+                    ) {
+                        out.push(egui::Event::AccessKitActionRequest(req));
+                    }
                 }
             }
         }
+
+        if deferred.is_empty() {
+            bridge.deferred_focus_target = None;
+        }
+        deferred
+    })
+    .unwrap_or_default();
+
+    if !deferred.is_empty() {
+        if let Ok(mut pending) = queue.lock() {
+            let tail = pending.split_off(0);
+            pending.extend(deferred);
+            pending.extend(tail);
+        }
+        ctx.request_repaint();
     }
+}
+
+fn should_defer_for_focus(
+    bridge: &mut WebDomBridge,
+    current_focus: Option<NodeId>,
+    target_node: NodeId,
+    focus_requested: &mut HashSet<NodeId>,
+    out: &mut Vec<egui::Event>,
+) -> bool {
+    if current_focus == Some(target_node) {
+        return false;
+    }
+    let can_focus = bridge
+        .tree
+        .spec(target_node)
+        .is_some_and(|s| s.focusable && !s.disabled);
+    if !can_focus || bridge.deferred_focus_target == Some(target_node) {
+        return false;
+    }
+    bridge.deferred_focus_target = Some(target_node);
+    if focus_requested.insert(target_node) {
+        out.push(egui::Event::AccessKitActionRequest(focus_action(
+            target_node,
+        )));
+        out.push(egui::Event::AccessKitActionRequest(
+            scroll_into_view_action(target_node),
+        ));
+    }
+    true
 }
 
 pub(crate) fn has_dom_focus(id: u64) -> bool {
@@ -150,6 +299,17 @@ impl Drop for AttachedListener {
             self.closure.as_ref().unchecked_ref(),
             self.capture,
         );
+    }
+}
+
+struct ActiveResizeObserver {
+    observer: ResizeObserver,
+    _closure: Closure<dyn FnMut()>,
+}
+
+impl Drop for ActiveResizeObserver {
+    fn drop(&mut self) {
+        self.observer.disconnect();
     }
 }
 
@@ -193,18 +353,22 @@ pub(crate) struct WebDomBridge {
     container: Element,
     tree: TreeBridge,
     elements: HashMap<NodeId, Element>,
-    specs: HashMap<NodeId, DomNodeSpec>,
     hoisted_children: HashMap<NodeId, Vec<NodeId>>,
-    text_editable: HashMap<NodeId, bool>,
     listeners: HashMap<NodeId, Vec<AttachedListener>>,
     viewport_listeners: Vec<AttachedListener>,
+    resize_observer: Option<ActiveResizeObserver>,
+    inert_elements: Vec<Element>,
     queue: ActionQueue,
     repaint_wakeup: RepaintWakeup,
     syncing_focus: Rc<Cell<bool>>,
     syncing_selection: Rc<Cell<bool>>,
     dom_owned_selection: Rc<RefCell<HashSet<NodeId>>>,
+    composing_nodes: Rc<RefCell<HashSet<NodeId>>>,
+    pending_text_reconcile: HashSet<NodeId>,
+    dom_action_in_flight: bool,
+    deferred_focus_target: Option<NodeId>,
     last_canvas_rect: Option<(f64, f64, f64, f64)>,
-    last_dpr: Option<f64>,
+    last_scale: Option<(f64, f64)>,
 }
 
 impl WebDomBridge {
@@ -244,8 +408,17 @@ impl WebDomBridge {
             let _ = style.set_property("position", "fixed");
             let _ = style.set_property("opacity", "0");
             let _ = style.set_property("pointer-events", "none");
-            let _ = style.set_property("overflow", "hidden");
             let _ = style.set_property("z-index", "1");
+            if canvas.is_some() {
+                let _ = style.set_property("overflow", "hidden");
+                let _ = style.set_property("contain", "strict");
+            } else {
+                let _ = style.set_property("left", "0px");
+                let _ = style.set_property("top", "0px");
+                let _ = style.set_property("width", "100%");
+                let _ = style.set_property("height", "100%");
+                let _ = style.set_property("contain", "layout style");
+            }
         }
 
         let mounted = if let Some(parent) = canvas.as_ref().and_then(|c| c.parent_node()) {
@@ -268,18 +441,22 @@ impl WebDomBridge {
             container,
             tree: TreeBridge::new(),
             elements: HashMap::new(),
-            specs: HashMap::new(),
             hoisted_children: HashMap::new(),
-            text_editable: HashMap::new(),
             listeners: HashMap::new(),
             viewport_listeners: Vec::new(),
+            resize_observer: None,
+            inert_elements: Vec::new(),
             queue,
             repaint_wakeup: Rc::new(RefCell::new(Some(wakeup))),
             syncing_focus: Rc::new(Cell::new(false)),
             syncing_selection: Rc::new(Cell::new(false)),
             dom_owned_selection: Rc::new(RefCell::new(HashSet::new())),
+            composing_nodes: Rc::new(RefCell::new(HashSet::new())),
+            pending_text_reconcile: HashSet::new(),
+            dom_action_in_flight: false,
+            deferred_focus_target: None,
             last_canvas_rect: None,
-            last_dpr: None,
+            last_scale: None,
         };
         let _ = bridge.sync_viewport();
         Some(bridge)
@@ -287,6 +464,8 @@ impl WebDomBridge {
 
     fn install_viewport_listeners(&mut self, id: u64) {
         self.viewport_listeners.clear();
+        self.resize_observer = None;
+
         let window_target: web_sys::EventTarget = self.window.clone().into();
         if let Some(l) = add_listener_with_options(&window_target, "scroll", true, true, move |_| {
             with_bridge_mut(id, Self::realign_viewport);
@@ -299,6 +478,19 @@ impl WebDomBridge {
             })
         {
             self.viewport_listeners.push(l);
+        }
+
+        if let Some(canvas) = &self.canvas {
+            let closure = Closure::wrap(Box::new(move || {
+                with_bridge_mut(id, Self::realign_viewport);
+            }) as Box<dyn FnMut()>);
+            if let Ok(observer) = ResizeObserver::new(closure.as_ref().unchecked_ref()) {
+                observer.observe(canvas);
+                self.resize_observer = Some(ActiveResizeObserver {
+                    observer,
+                    _closure: closure,
+                });
+            }
         }
 
         let container_target: web_sys::EventTarget = self.container.clone().into();
@@ -345,18 +537,22 @@ impl WebDomBridge {
             .and_then(|raw| raw.parse::<u64>().ok())
             .map(NodeId);
 
-        let (dpr, canvas_origin, viewport_changed) = self.sync_viewport();
-        let ops = self.tree.apply_update(update);
+        let (scale, scale_changed) = self.sync_viewport();
+        let ops = self.tree.apply_update_diff(update);
         let mut saw_focus_op = false;
 
         for op in ops {
             match op {
-                DomOp::Upsert(spec) => self.upsert_node(spec, dpr, canvas_origin),
-                DomOp::SetChildren { parent, children } => self.set_children(parent, &children),
-                DomOp::Remove(id) => self.remove_node(id),
-                DomOp::SetFocus(target) => {
+                BridgeOp::Upsert { old, spec } => {
+                    self.upsert_node(old.as_ref(), spec, scale);
+                }
+                BridgeOp::SetChildren { parent, children } => self.set_children(parent, &children),
+                BridgeOp::Remove(id) => self.remove_node(id),
+                BridgeOp::SetFocus(target) => {
                     saw_focus_op = true;
-                    self.set_focus(target);
+                    if self.has_dom_focus() || self.dom_action_in_flight {
+                        self.set_focus(target);
+                    }
                 }
             }
         }
@@ -365,7 +561,7 @@ impl WebDomBridge {
         // Blink without changing AccessKit's focused NodeId; restore focus & selection.
         if !saw_focus_op
             && let Some(focused_id) = prev_focused_id
-            && self.specs.get(&focused_id).is_some_and(|s| !s.disabled)
+            && self.tree.spec(focused_id).is_some_and(|s| !s.disabled)
             && let Some(el) = self.elements.get(&focused_id)
             && active_element_for(self.container.as_ref(), &self.document).as_ref() != Some(el)
         {
@@ -383,27 +579,34 @@ impl WebDomBridge {
             }
         }
 
-        if viewport_changed {
-            self.reapply_all_bounds(dpr, canvas_origin);
+        self.reconcile_text_inputs();
+        self.sync_modal_inert();
+
+        if scale_changed {
+            self.reapply_all_bounds(scale);
         }
+        self.dom_action_in_flight = false;
     }
 
     pub(crate) fn realign_viewport(&mut self) {
-        let (dpr, canvas_origin, viewport_changed) = self.sync_viewport();
-        if viewport_changed {
-            self.reapply_all_bounds(dpr, canvas_origin);
+        let (scale, scale_changed) = self.sync_viewport();
+        if scale_changed {
+            self.reapply_all_bounds(scale);
         }
     }
 
     pub(crate) fn destroy(&mut self) {
         *self.repaint_wakeup.borrow_mut() = None;
+        self.resize_observer = None;
         self.viewport_listeners.clear();
         self.listeners.clear();
+        self.clear_modal_inert();
         self.dom_owned_selection.borrow_mut().clear();
+        self.composing_nodes.borrow_mut().clear();
+        self.pending_text_reconcile.clear();
         self.hoisted_children.clear();
-        self.text_editable.clear();
         self.elements.clear();
-        self.specs.clear();
+        self.tree = TreeBridge::new();
         self.container.remove();
     }
 
@@ -413,53 +616,177 @@ impl WebDomBridge {
             .is_ok_and(|q| q.iter().any(|ev| ev.targets_text_state(id)))
     }
 
-    fn reapply_all_bounds(&self, dpr: f64, canvas_origin: (f64, f64)) {
-        for (id, element) in &self.elements {
-            if let Some(spec) = self.specs.get(id) {
-                apply_bounds(element, spec.bounds, dpr, canvas_origin);
+    fn reconcile_text_inputs(&mut self) {
+        if self.pending_text_reconcile.is_empty() {
+            return;
+        }
+        let ids: Vec<NodeId> = self.pending_text_reconcile.drain().collect();
+        for id in ids {
+            if self.composing_nodes.borrow().contains(&id) || self.has_pending_text_event(id) {
+                self.pending_text_reconcile.insert(id);
+                continue;
+            }
+            if let (Some(el), Some(spec)) = (self.elements.get(&id), self.tree.spec(id)) {
+                sync_text_element_value(el, spec);
             }
         }
     }
 
-    fn sync_viewport(&mut self) -> (f64, (f64, f64), bool) {
+    fn clear_modal_inert(&mut self) {
+        for el in self.inert_elements.drain(..) {
+            let _ = el.remove_attribute("inert");
+        }
+    }
+
+    fn sync_modal_inert(&mut self) {
+        self.clear_modal_inert();
+        let Some(modal_el) = self.find_top_modal_element() else {
+            return;
+        };
+
+        let container_el = self.container.clone();
+        let mut current = modal_el;
+        while let Some(parent) = current.parent_element() {
+            let mut sib = parent.first_element_child();
+            while let Some(child) = sib {
+                sib = child.next_element_sibling();
+                if child != current && !child.has_attribute("inert") {
+                    let _ = child.set_attribute("inert", "");
+                    self.inert_elements.push(child);
+                }
+            }
+            if parent == container_el {
+                break;
+            }
+            current = parent;
+        }
+    }
+
+    fn find_top_modal_element(&self) -> Option<Element> {
+        let mut stack = Vec::new();
+        let mut child = self.container.first_element_child();
+        while let Some(el) = child {
+            child = el.next_element_sibling();
+            stack.push(el);
+        }
+        while let Some(el) = stack.pop() {
+            if el
+                .get_attribute("data-accesskit-id")
+                .and_then(|raw| raw.parse::<u64>().ok())
+                .map(NodeId)
+                .and_then(|id| self.tree.spec(id))
+                .is_some_and(|s| s.modal && !s.disabled)
+            {
+                return Some(el);
+            }
+            let mut c = el.first_element_child();
+            while let Some(inner) = c {
+                c = inner.next_element_sibling();
+                stack.push(inner);
+            }
+        }
+        None
+    }
+
+    fn reapply_all_bounds(&self, scale: (f64, f64)) {
+        for (id, element) in &self.elements {
+            if let Some(spec) = self.tree.spec(*id) {
+                apply_bounds(element, spec.bounds, scale);
+            }
+        }
+    }
+
+    fn sync_viewport(&mut self) -> ((f64, f64), bool) {
         let raw_dpr = self.window.device_pixel_ratio();
         let dpr = if raw_dpr > 0.0 && raw_dpr.is_finite() {
             raw_dpr
         } else {
             1.0
         };
-        let dpr_changed = self.last_dpr != Some(dpr);
-        self.last_dpr = Some(dpr);
 
-        let (origin, rect_changed) = if let Some(canvas) = &self.canvas {
+        let next_scale = if let Some(canvas) = &self.canvas {
             let rect = canvas.get_bounding_client_rect();
-            let origin_x = rect.left() + f64::from(canvas.client_left());
-            let origin_y = rect.top() + f64::from(canvas.client_top());
-            let next = (origin_x, origin_y, rect.width(), rect.height());
-            let changed = self.last_canvas_rect != Some(next);
-            if changed {
-                self.last_canvas_rect = Some(next);
+            let client_left = f64::from(canvas.client_left());
+            let client_top = f64::from(canvas.client_top());
+            let client_w = f64::from(canvas.client_width());
+            let client_h = f64::from(canvas.client_height());
+            let (offset_w, offset_h) = canvas
+                .dyn_ref::<HtmlElement>()
+                .map(|h| (f64::from(h.offset_width()), f64::from(h.offset_height())))
+                .unwrap_or((0.0, 0.0));
+            let ratio_x = if offset_w > 0.0 && rect.width() > 0.0 {
+                rect.width() / offset_w
+            } else {
+                1.0
+            };
+            let ratio_y = if offset_h > 0.0 && rect.height() > 0.0 {
+                rect.height() / offset_h
+            } else {
+                1.0
+            };
+
+            let origin_x = rect.left() + client_left * ratio_x;
+            let origin_y = rect.top() + client_top * ratio_y;
+            let content_w = if client_w > 0.0 {
+                client_w * ratio_x
+            } else {
+                rect.width()
+            };
+            let content_h = if client_h > 0.0 {
+                client_h * ratio_y
+            } else {
+                rect.height()
+            };
+
+            let prev = self.last_canvas_rect;
+            let next_rect = (origin_x, origin_y, content_w, content_h);
+            if prev != Some(next_rect) {
+                self.last_canvas_rect = Some(next_rect);
                 if let Some(html) = self.container.dyn_ref::<HtmlElement>() {
                     let style = html.style();
-                    let _ = style.set_property("left", &format!("{}px", next.0));
-                    let _ = style.set_property("top", &format!("{}px", next.1));
-                    let _ = style.set_property("width", &format!("{}px", next.2));
-                    let _ = style.set_property("height", &format!("{}px", next.3));
+                    if prev.is_none_or(|p| p.0 != origin_x || p.1 != origin_y) {
+                        let _ = style.set_property("left", &format!("{origin_x}px"));
+                        let _ = style.set_property("top", &format!("{origin_y}px"));
+                    }
+                    if prev.is_none_or(|p| p.2 != content_w || p.3 != content_h) {
+                        let _ = style.set_property("width", &format!("{content_w}px"));
+                        let _ = style.set_property("height", &format!("{content_h}px"));
+                    }
                 }
             }
-            ((origin_x, origin_y), changed)
+
+            let (buf_w, buf_h) = canvas
+                .dyn_ref::<HtmlCanvasElement>()
+                .map(|c| (f64::from(c.width()), f64::from(c.height())))
+                .unwrap_or((0.0, 0.0));
+            let scale_x = if buf_w > 0.0 && content_w > 0.0 {
+                content_w / buf_w
+            } else {
+                1.0 / dpr
+            };
+            let scale_y = if buf_h > 0.0 && content_h > 0.0 {
+                content_h / buf_h
+            } else {
+                1.0 / dpr
+            };
+            (scale_x, scale_y)
         } else {
-            ((0.0, 0.0), false)
+            (1.0 / dpr, 1.0 / dpr)
         };
 
-        (dpr, origin, dpr_changed || rect_changed)
+        let scale_changed = self.last_scale != Some(next_scale);
+        self.last_scale = Some(next_scale);
+        (next_scale, scale_changed)
     }
 
-    fn upsert_node(&mut self, spec: DomNodeSpec, dpr: f64, canvas_origin: (f64, f64)) {
+    fn upsert_node(
+        &mut self,
+        old_spec: Option<&DomNodeSpec>,
+        spec: DomNodeSpec,
+        scale: (f64, f64),
+    ) {
         let id = spec.id;
-        let old_spec = self.specs.get(&id);
         let desired_tag = element_tag_name(&spec);
-        let can_edit_text = self.tree.supports_text_edit_actions(id);
         let tag_changed = old_spec.is_some_and(|old| element_tag_name(old) != desired_tag);
         let needs_rebind = old_spec.is_none_or(|old| {
             element_tag_name(old) != desired_tag
@@ -469,14 +796,23 @@ impl WebDomBridge {
                 || old.focusable != spec.focusable
                 || old.disabled != spec.disabled
                 || old.read_only != spec.read_only
-        }) || self.text_editable.get(&id).copied() != Some(can_edit_text);
+        });
 
-        let element = if tag_changed || !self.elements.contains_key(&id) {
+        let created = tag_changed || !self.elements.contains_key(&id);
+        let element = if created {
             let Ok(new_el) = self.document.create_element(desired_tag) else {
                 return;
             };
             let _ = new_el.set_attribute("id", &dom_element_id(self.bridge_id, id));
             let _ = new_el.set_attribute("data-accesskit-id", &id.0.to_string());
+            if let Some(html) = new_el.dyn_ref::<HtmlElement>() {
+                let style = html.style();
+                let _ = style.set_property("margin", "0");
+                let _ = style.set_property("padding", "0");
+                let _ = style.set_property("border", "0");
+                let _ = style.set_property("box-sizing", "border-box");
+                let _ = style.set_property("pointer-events", "none");
+            }
             if let Some(old_el) = self.elements.insert(id, new_el.clone()) {
                 if let Some(parent) = old_el.parent_node() {
                     let _ = parent.replace_child(&new_el, &old_el);
@@ -490,12 +826,14 @@ impl WebDomBridge {
             self.elements.get(&id).unwrap().clone()
         };
 
-        let skip_text_sync = self.has_pending_text_event(id);
+        let is_composing = self.composing_nodes.borrow().contains(&id);
+        let skip_text_sync = is_composing || self.has_pending_text_event(id);
+        let attr_old = if created { None } else { old_spec };
         apply_dom_attributes(
             &element,
+            attr_old,
             &spec,
-            dpr,
-            canvas_origin,
+            scale,
             skip_text_sync,
             self.hoisted_children.get(&id).map(Vec::as_slice),
             self.bridge_id,
@@ -532,24 +870,16 @@ impl WebDomBridge {
             let _ = self.container.append_child(&element);
         }
 
-        if needs_rebind {
+        if created || needs_rebind {
             self.listeners.remove(&id);
-            let attached = self.attach_listeners(&element, &spec, can_edit_text);
+            let attached = self.attach_listeners(&element, &spec);
             if !attached.is_empty() {
                 self.listeners.insert(id, attached);
             }
         }
-
-        self.text_editable.insert(id, can_edit_text);
-        self.specs.insert(id, spec);
     }
 
-    fn attach_listeners(
-        &self,
-        element: &Element,
-        spec: &DomNodeSpec,
-        can_edit_text: bool,
-    ) -> Vec<AttachedListener> {
+    fn attach_listeners(&self, element: &Element, spec: &DomNodeSpec) -> Vec<AttachedListener> {
         let mut out = Vec::new();
         let target: web_sys::EventTarget = element.clone().into();
         let id = spec.id;
@@ -585,18 +915,17 @@ impl WebDomBridge {
                 }
             }
             InteractionKind::Text => {
-                if !spec.read_only && can_edit_text {
-                    let el_for_input = element.clone();
-                    let queue = Arc::clone(&self.queue);
-                    let wakeup = Rc::clone(&self.repaint_wakeup);
-                    if spec.input_type == Some("password") {
-                        let prev_val = Rc::new(RefCell::new(
+                if !spec.read_only {
+                    let is_password = spec.input_type == Some("password");
+                    let prev_val = is_password.then(|| {
+                        Rc::new(RefCell::new(
                             read_text_value(element).unwrap_or_default(),
-                        ));
-                        let owned_selection = Rc::clone(&self.dom_owned_selection);
+                        ))
+                    });
+                    if let Some(prev_pw) = prev_val.as_ref() {
                         for event_name in ["focus", "beforeinput"] {
                             let el_snap = element.clone();
-                            let prev_snap = Rc::clone(&prev_val);
+                            let prev_snap = Rc::clone(prev_pw);
                             if let Some(l) = add_listener(&target, event_name, move |_event| {
                                 if let Some(val) = read_text_value(&el_snap) {
                                     *prev_snap.borrow_mut() = val;
@@ -605,61 +934,68 @@ impl WebDomBridge {
                                 out.push(l);
                             }
                         }
-                        if let Some(l) = add_listener(&target, "input", move |event| {
-                            event.stop_propagation();
-                            let Some(new_val) = read_text_value(&el_for_input) else {
-                                return;
-                            };
-                            let mut prev = prev_val.borrow_mut();
-                            if new_val.chars().any(is_password_mask_char) {
-                                let (anchor_utf16, focus_utf16, inserted) =
-                                    password_diff_utf16(&prev, &new_val);
-                                *prev = new_val;
-                                if let Ok(mut guard) = queue.lock() {
-                                    guard.retain(|ev| !ev.targets_text_state(id));
-                                    guard.push(PendingDomEvent::TextSelection {
-                                        target_node: id,
-                                        anchor_utf16,
-                                        focus_utf16,
-                                    });
-                                    guard.push(PendingDomEvent::Action(
-                                        replace_selected_text_action(id, inserted),
-                                    ));
-                                }
-                                if let Some(cb) = wakeup.borrow().as_ref() {
-                                    cb();
-                                }
-                            } else {
-                                *prev = new_val.clone();
-                                owned_selection.borrow_mut().insert(id);
-                                push_coalesced_value(&queue, &wakeup, id, set_value_action(id, new_val));
-                            }
-                        }) {
-                            out.push(l);
-                        }
-                    } else {
-                        let owned_selection = Rc::clone(&self.dom_owned_selection);
-                        if let Some(l) = add_listener(&target, "input", move |event| {
-                            event.stop_propagation();
-                            if let Some(val) = read_text_value(&el_for_input) {
-                                owned_selection.borrow_mut().insert(id);
-                                push_coalesced_value(&queue, &wakeup, id, set_value_action(id, val));
-                            }
-                        }) {
-                            out.push(l);
-                        }
                     }
-                } else if !spec.read_only
-                    && let Some(l) = add_listener(&target, "beforeinput", |event| {
-                        event.prevent_default();
-                    })
-                {
-                    out.push(l);
+
+                    let composing = Rc::clone(&self.composing_nodes);
+                    if let Some(l) = add_listener(&target, "compositionstart", move |event| {
+                        event.stop_propagation();
+                        composing.borrow_mut().insert(id);
+                    }) {
+                        out.push(l);
+                    }
+
+                    let el_input = element.clone();
+                    let queue_input = Arc::clone(&self.queue);
+                    let wakeup_input = Rc::clone(&self.repaint_wakeup);
+                    let owned_input = Rc::clone(&self.dom_owned_selection);
+                    let composing_input = Rc::clone(&self.composing_nodes);
+                    let prev_input = prev_val.clone();
+                    if let Some(l) = add_listener(&target, "input", move |event| {
+                        event.stop_propagation();
+                        if event
+                            .dyn_ref::<InputEvent>()
+                            .is_some_and(|ie| ie.is_composing())
+                        {
+                            composing_input.borrow_mut().insert(id);
+                            return;
+                        }
+                        composing_input.borrow_mut().remove(&id);
+                        commit_text_value(
+                            &el_input,
+                            id,
+                            prev_input.as_deref(),
+                            &owned_input,
+                            &queue_input,
+                            &wakeup_input,
+                        );
+                    }) {
+                        out.push(l);
+                    }
+
+                    let el_comp = element.clone();
+                    let queue_comp = Arc::clone(&self.queue);
+                    let wakeup_comp = Rc::clone(&self.repaint_wakeup);
+                    let owned_comp = Rc::clone(&self.dom_owned_selection);
+                    let composing_end = Rc::clone(&self.composing_nodes);
+                    if let Some(l) = add_listener(&target, "compositionend", move |event| {
+                        event.stop_propagation();
+                        composing_end.borrow_mut().remove(&id);
+                        commit_text_value(
+                            &el_comp,
+                            id,
+                            prev_val.as_deref(),
+                            &owned_comp,
+                            &queue_comp,
+                            &wakeup_comp,
+                        );
+                    }) {
+                        out.push(l);
+                    }
                 }
                 if let Some(l) = add_listener(&target, "keydown", |event| {
                     if let Some(kb) = event.dyn_ref::<KeyboardEvent>() {
                         let key = kb.key();
-                        if key != "Tab" && key != "Escape" {
+                        if kb.is_composing() || (key != "Tab" && key != "Escape") {
                             event.stop_propagation();
                         }
                     }
@@ -683,9 +1019,15 @@ impl WebDomBridge {
                     let syncing = Rc::clone(&self.syncing_selection);
                     if let Some(l) = add_listener(&target, "keyup", move |event| {
                         if let Some(kb) = event.dyn_ref::<KeyboardEvent>()
+                            && !kb.is_composing()
                             && matches!(
                                 kb.key().as_str(),
-                                "ArrowLeft" | "ArrowRight" | "ArrowUp" | "ArrowDown" | "Home" | "End"
+                                "ArrowLeft"
+                                    | "ArrowRight"
+                                    | "ArrowUp"
+                                    | "ArrowDown"
+                                    | "Home"
+                                    | "End"
                             )
                         {
                             emit_dom_selection(&el_for_keyup, id, &syncing, &queue, &wakeup);
@@ -771,7 +1113,7 @@ impl WebDomBridge {
         if Some(parent) == self.tree.root_id() && parent_el.parent_node().is_none() {
             let _ = self.container.append_child(&parent_el);
         }
-        if let Some(parent_spec) = self.specs.get(&parent).cloned()
+        if let Some(parent_spec) = self.tree.spec(parent).cloned()
             && is_leaf_tag(parent_spec.tag)
         {
             // Hoist popups/children attached to leaf elements (<button>, <input>, etc.)
@@ -841,9 +1183,12 @@ impl WebDomBridge {
 
     fn remove_node(&mut self, id: NodeId) {
         self.listeners.remove(&id);
-        self.specs.remove(&id);
-        self.text_editable.remove(&id);
         self.dom_owned_selection.borrow_mut().remove(&id);
+        self.composing_nodes.borrow_mut().remove(&id);
+        self.pending_text_reconcile.remove(&id);
+        if self.deferred_focus_target == Some(id) {
+            self.deferred_focus_target = None;
+        }
         if let Some(old_hoisted) = self.hoisted_children.remove(&id) {
             let container_node: &web_sys::Node = self.container.as_ref();
             for child_id in old_hoisted {
@@ -871,7 +1216,7 @@ impl WebDomBridge {
         }
         for parent_id in touched_parents {
             if let Some(parent_el) = self.elements.get(&parent_id)
-                && let Some(parent_spec) = self.specs.get(&parent_id)
+                && let Some(parent_spec) = self.tree.spec(parent_id)
             {
                 sync_disclosure_attrs(
                     parent_el,
@@ -909,6 +1254,51 @@ impl WebDomBridge {
             self.syncing_focus.set(false);
         }
     }
+}
+
+fn commit_text_value(
+    element: &Element,
+    id: NodeId,
+    prev_pw: Option<&RefCell<String>>,
+    owned_selection: &RefCell<HashSet<NodeId>>,
+    queue: &ActionQueue,
+    wakeup: &RepaintWakeup,
+) {
+    let Some(new_val) = read_text_value(element) else {
+        return;
+    };
+    if let Some(prev_pw) = prev_pw {
+        let mut prev = prev_pw.borrow_mut();
+        if new_val.chars().any(is_password_mask_char) {
+            let (anchor_utf16, focus_utf16, inserted) = password_diff_utf16(&prev, &new_val);
+            *prev = new_val;
+            push_text_event(
+                queue,
+                wakeup,
+                id,
+                PendingDomEvent::ReplaceRange {
+                    target_node: id,
+                    anchor_utf16,
+                    focus_utf16,
+                    text: inserted,
+                },
+                false,
+            );
+            return;
+        }
+        *prev = new_val.clone();
+    }
+    owned_selection.borrow_mut().insert(id);
+    push_text_event(
+        queue,
+        wakeup,
+        id,
+        PendingDomEvent::SetValue {
+            target_node: id,
+            value: new_val,
+        },
+        true,
+    );
 }
 
 fn active_element_for(node: &web_sys::Node, document: &Document) -> Option<Element> {
@@ -1064,15 +1454,22 @@ fn queue_text_selection(
     }
 }
 
-fn push_coalesced_value(
+fn push_text_event(
     queue: &ActionQueue,
     wakeup: &RepaintWakeup,
     id: NodeId,
-    request: ActionRequest,
+    event: PendingDomEvent,
+    replace_all: bool,
 ) {
     if let Ok(mut guard) = queue.lock() {
-        guard.retain(|ev| !ev.targets_text_state(id));
-        guard.push(PendingDomEvent::Action(request));
+        if replace_all {
+            guard.retain(|ev| !ev.targets_text_state(id));
+        } else {
+            guard.retain(|ev| {
+                !(ev.target_node() == id && matches!(ev, PendingDomEvent::TextSelection { .. }))
+            });
+        }
+        guard.push(event);
     }
     if let Some(cb) = wakeup.borrow().as_ref() {
         cb();
@@ -1170,16 +1567,43 @@ fn sync_disclosure_attrs(
     set_optional_attr(element, "aria-controls", controls.as_deref());
 }
 
+fn sync_text_element_value(element: &Element, spec: &DomNodeSpec) {
+    if let Some(input_el) = element.dyn_ref::<HtmlInputElement>() {
+        if !matches!(spec.input_type, Some("checkbox" | "radio" | "range"))
+            && spec.aria_role != Some("spinbutton")
+        {
+            let val = spec.value.as_deref().unwrap_or("");
+            if spec.input_type == Some("password") {
+                let current = input_el.value();
+                if current.chars().count() != val.chars().count()
+                    || (val.is_empty() && !current.is_empty())
+                {
+                    input_el.set_value(val);
+                }
+            } else if input_el.value() != val {
+                input_el.set_value(val);
+            }
+        }
+    } else if let Some(textarea_el) = element.dyn_ref::<HtmlTextAreaElement>() {
+        let val = spec.value.as_deref().unwrap_or("");
+        if textarea_el.value() != val {
+            textarea_el.set_value(val);
+        }
+    }
+}
+
 fn apply_dom_attributes(
     element: &Element,
+    old: Option<&DomNodeSpec>,
     spec: &DomNodeSpec,
-    dpr: f64,
-    canvas_origin: (f64, f64),
+    scale: (f64, f64),
     skip_value_sync: bool,
     hoisted: Option<&[NodeId]>,
     bridge_id: u64,
 ) {
     let effective_role = effective_role_for(spec);
+    let old_effective_role = old.and_then(effective_role_for);
+    let role_changed = old.is_none_or(|_| old_effective_role != effective_role);
     let supports_range_aria = matches!(
         effective_role,
         Some("slider" | "spinbutton" | "progressbar" | "scrollbar" | "meter")
@@ -1203,46 +1627,74 @@ fn apply_dom_attributes(
         None
     };
 
-    set_optional_attr(element, "role", effective_role);
-    set_optional_attr(
-        element,
-        "aria-label",
-        spec.label.as_deref().or(fallback_label),
-    );
-    set_optional_attr(element, "aria-description", spec.description.as_deref());
-    set_optional_attr(element, "placeholder", spec.placeholder.as_deref());
-    set_optional_attr(
-        element,
-        "aria-valuetext",
-        supports_range_aria
-            .then(|| spec.numeric_value.and(spec.value.as_deref()))
-            .flatten(),
-    );
-
-    let heading_level = spec.heading_level.map(|n| n.to_string());
-    set_optional_attr(element, "aria-level", heading_level.as_deref());
-    set_optional_attr(element, "aria-modal", spec.modal.then_some("true"));
-    let live = match spec.live {
-        Some(Live::Polite) => Some("polite"),
-        Some(Live::Assertive) => Some("assertive"),
-        _ => None,
-    };
-    set_optional_attr(element, "aria-live", live);
-    set_optional_attr(
-        element,
-        "aria-multiline",
-        (spec.tag == DomTag::TextArea).then_some("true"),
-    );
-
-    if let Some(input_type) = spec.input_type {
-        let _ = element.set_attribute("type", input_type);
-    } else if spec.tag == DomTag::Button {
-        let _ = element.set_attribute("type", "button");
-    } else {
-        let _ = element.remove_attribute("type");
+    if role_changed {
+        set_optional_attr(element, "role", effective_role);
+    }
+    if role_changed || old.is_none_or(|o| o.label != spec.label || o.value != spec.value) {
+        set_optional_attr(
+            element,
+            "aria-label",
+            spec.label.as_deref().or(fallback_label),
+        );
+    }
+    if old.is_none_or(|o| o.description != spec.description) {
+        set_optional_attr(element, "aria-description", spec.description.as_deref());
+    }
+    if old.is_none_or(|o| o.placeholder != spec.placeholder) {
+        set_optional_attr(element, "placeholder", spec.placeholder.as_deref());
+    }
+    if role_changed
+        || old.is_none_or(|o| {
+            o.input_type != spec.input_type
+                || o.numeric_value != spec.numeric_value
+                || o.value != spec.value
+        })
+    {
+        set_optional_attr(
+            element,
+            "aria-valuetext",
+            supports_range_aria
+                .then(|| spec.numeric_value.and(spec.value.as_deref()))
+                .flatten(),
+        );
     }
 
-    if spec.tag == DomTag::Anchor {
+    if old.is_none_or(|o| o.heading_level != spec.heading_level) {
+        let heading_level = spec.heading_level.map(|n| n.to_string());
+        set_optional_attr(element, "aria-level", heading_level.as_deref());
+    }
+    if old.is_none_or(|o| o.modal != spec.modal) {
+        set_optional_attr(element, "aria-modal", spec.modal.then_some("true"));
+    }
+    if old.is_none_or(|o| o.live != spec.live) {
+        let live = match spec.live {
+            Some(Live::Polite) => Some("polite"),
+            Some(Live::Assertive) => Some("assertive"),
+            _ => None,
+        };
+        set_optional_attr(element, "aria-live", live);
+    }
+    if old.is_none_or(|o| o.tag != spec.tag) {
+        set_optional_attr(
+            element,
+            "aria-multiline",
+            (spec.tag == DomTag::TextArea).then_some("true"),
+        );
+    }
+
+    if old.is_none_or(|o| o.input_type != spec.input_type || o.tag != spec.tag) {
+        if let Some(input_type) = spec.input_type {
+            let _ = element.set_attribute("type", input_type);
+        } else if spec.tag == DomTag::Button {
+            let _ = element.set_attribute("type", "button");
+        } else {
+            let _ = element.remove_attribute("type");
+        }
+    }
+
+    if spec.tag == DomTag::Anchor
+        && old.is_none_or(|o| o.tag != spec.tag || o.disabled != spec.disabled || o.url != spec.url)
+    {
         if spec.disabled {
             let _ = element.remove_attribute("href");
         } else {
@@ -1250,164 +1702,210 @@ fn apply_dom_attributes(
         }
     }
 
-    if spec.disabled {
-        if matches!(spec.tag, DomTag::Button | DomTag::Input | DomTag::TextArea) {
-            let _ = element.set_attribute("disabled", "");
+    if old.is_none_or(|o| o.disabled != spec.disabled || o.tag != spec.tag) {
+        if spec.disabled {
+            if matches!(spec.tag, DomTag::Button | DomTag::Input | DomTag::TextArea) {
+                let _ = element.set_attribute("disabled", "");
+            }
+            let _ = element.set_attribute("aria-disabled", "true");
+        } else {
+            let _ = element.remove_attribute("disabled");
+            let _ = element.remove_attribute("aria-disabled");
         }
-        let _ = element.set_attribute("aria-disabled", "true");
-    } else {
-        let _ = element.remove_attribute("disabled");
-        let _ = element.remove_attribute("aria-disabled");
     }
 
-    if spec.read_only {
-        let _ = element.set_attribute("readonly", "");
-        let _ = element.set_attribute("aria-readonly", "true");
-    } else {
-        let _ = element.remove_attribute("readonly");
-        let _ = element.remove_attribute("aria-readonly");
+    if old.is_none_or(|o| o.read_only != spec.read_only) {
+        if spec.read_only {
+            let _ = element.set_attribute("readonly", "");
+            let _ = element.set_attribute("aria-readonly", "true");
+        } else {
+            let _ = element.remove_attribute("readonly");
+            let _ = element.remove_attribute("aria-readonly");
+        }
     }
 
-    sync_disclosure_attrs(element, spec, hoisted, bridge_id);
-
-    let toggled_str = spec.toggled.map(|t| match t {
-        Toggled::True => "true",
-        Toggled::False => "false",
-        Toggled::Mixed => "mixed",
-    });
-    if spec.tag == DomTag::Button && matches!(effective_role, None | Some("button")) {
-        let _ = element.remove_attribute("aria-checked");
-        let _ = element.remove_attribute("aria-selected");
-        set_optional_attr(element, "aria-pressed", toggled_str);
-    } else if matches!(effective_role, Some("option" | "tab")) {
-        let _ = element.remove_attribute("aria-pressed");
-        let _ = element.remove_attribute("aria-checked");
-        let selected = spec.toggled.map(|t| match t {
-            Toggled::True => "true",
-            Toggled::False | Toggled::Mixed => "false",
-        });
-        set_optional_attr(element, "aria-selected", selected);
-    } else if matches!(
-        effective_role,
-        Some("checkbox" | "radio" | "switch" | "menuitemcheckbox" | "menuitemradio")
-    ) || matches!(spec.input_type, Some("checkbox" | "radio"))
+    if hoisted.is_some()
+        || role_changed
+        || old.is_none_or(|o| o.expanded != spec.expanded)
     {
-        let _ = element.remove_attribute("aria-pressed");
-        let _ = element.remove_attribute("aria-selected");
-        set_optional_attr(element, "aria-checked", toggled_str);
-    } else {
-        let _ = element.remove_attribute("aria-pressed");
-        let _ = element.remove_attribute("aria-checked");
-        let _ = element.remove_attribute("aria-selected");
+        sync_disclosure_attrs(element, spec, hoisted, bridge_id);
     }
 
-    if spec.focusable && !spec.disabled && !natively_focusable(spec.tag) {
-        let _ = element.set_attribute("tabindex", "0");
-    } else {
-        let _ = element.remove_attribute("tabindex");
+    if role_changed
+        || old.is_none_or(|o| {
+            o.toggled != spec.toggled || o.tag != spec.tag || o.input_type != spec.input_type
+        })
+    {
+        let toggled_str = spec.toggled.map(|t| match t {
+            Toggled::True => "true",
+            Toggled::False => "false",
+            Toggled::Mixed => "mixed",
+        });
+        if spec.tag == DomTag::Button && matches!(effective_role, None | Some("button")) {
+            let _ = element.remove_attribute("aria-checked");
+            let _ = element.remove_attribute("aria-selected");
+            set_optional_attr(element, "aria-pressed", toggled_str);
+        } else if matches!(
+            effective_role,
+            Some("option" | "tab" | "treeitem" | "gridcell" | "row")
+        ) {
+            let _ = element.remove_attribute("aria-pressed");
+            let _ = element.remove_attribute("aria-checked");
+            let selected = spec.toggled.map(|t| match t {
+                Toggled::True => "true",
+                Toggled::False | Toggled::Mixed => "false",
+            });
+            set_optional_attr(element, "aria-selected", selected);
+        } else if matches!(
+            effective_role,
+            Some("checkbox" | "radio" | "switch" | "menuitemcheckbox" | "menuitemradio")
+        ) || matches!(spec.input_type, Some("checkbox" | "radio"))
+        {
+            let _ = element.remove_attribute("aria-pressed");
+            let _ = element.remove_attribute("aria-selected");
+            set_optional_attr(element, "aria-checked", toggled_str);
+        } else {
+            let _ = element.remove_attribute("aria-pressed");
+            let _ = element.remove_attribute("aria-checked");
+            let _ = element.remove_attribute("aria-selected");
+        }
     }
 
-    set_optional_attr(
-        element,
-        "aria-valuemin",
-        supports_range_aria
-            .then(|| spec.numeric_min.map(|v| v.to_string()))
-            .flatten()
-            .as_deref(),
-    );
-    set_optional_attr(
-        element,
-        "aria-valuemax",
-        supports_range_aria
-            .then(|| spec.numeric_max.map(|v| v.to_string()))
-            .flatten()
-            .as_deref(),
-    );
-    set_optional_attr(
-        element,
-        "aria-valuenow",
-        supports_range_aria
-            .then(|| spec.numeric_value.map(|v| v.to_string()))
-            .flatten()
-            .as_deref(),
-    );
+    if old.is_none_or(|o| {
+        o.focusable != spec.focusable || o.disabled != spec.disabled || o.tag != spec.tag
+    }) {
+        if spec.focusable && !spec.disabled && !natively_focusable(spec.tag) {
+            let _ = element.set_attribute("tabindex", "0");
+        } else {
+            let _ = element.remove_attribute("tabindex");
+        }
+    }
+
+    if role_changed
+        || old.is_none_or(|o| {
+            o.input_type != spec.input_type
+                || o.numeric_min != spec.numeric_min
+                || o.numeric_max != spec.numeric_max
+                || o.numeric_value != spec.numeric_value
+        })
+    {
+        set_optional_attr(
+            element,
+            "aria-valuemin",
+            supports_range_aria
+                .then(|| spec.numeric_min.map(|v| v.to_string()))
+                .flatten()
+                .as_deref(),
+        );
+        set_optional_attr(
+            element,
+            "aria-valuemax",
+            supports_range_aria
+                .then(|| spec.numeric_max.map(|v| v.to_string()))
+                .flatten()
+                .as_deref(),
+        );
+        set_optional_attr(
+            element,
+            "aria-valuenow",
+            supports_range_aria
+                .then(|| spec.numeric_value.map(|v| v.to_string()))
+                .flatten()
+                .as_deref(),
+        );
+    }
 
     if let Some(input_el) = element.dyn_ref::<HtmlInputElement>() {
-        input_el.set_disabled(spec.disabled);
-        input_el.set_read_only(spec.read_only);
-        match spec.toggled {
-            Some(Toggled::True) => {
-                input_el.set_indeterminate(false);
-                if !input_el.checked() {
-                    input_el.set_checked(true);
+        if old.is_none_or(|o| o.disabled != spec.disabled) {
+            input_el.set_disabled(spec.disabled);
+        }
+        if old.is_none_or(|o| o.read_only != spec.read_only) {
+            input_el.set_read_only(spec.read_only);
+        }
+        if old.is_none_or(|o| o.toggled != spec.toggled) {
+            match spec.toggled {
+                Some(Toggled::True) => {
+                    input_el.set_indeterminate(false);
+                    if !input_el.checked() {
+                        input_el.set_checked(true);
+                    }
                 }
-            }
-            Some(Toggled::False) => {
-                input_el.set_indeterminate(false);
-                if input_el.checked() {
-                    input_el.set_checked(false);
+                Some(Toggled::False) => {
+                    input_el.set_indeterminate(false);
+                    if input_el.checked() {
+                        input_el.set_checked(false);
+                    }
                 }
-            }
-            Some(Toggled::Mixed) => {
-                input_el.set_indeterminate(true);
-                if input_el.checked() {
-                    input_el.set_checked(false);
+                Some(Toggled::Mixed) => {
+                    input_el.set_indeterminate(true);
+                    if input_el.checked() {
+                        input_el.set_checked(false);
+                    }
                 }
-            }
-            None => {
-                input_el.set_indeterminate(false);
+                None => {
+                    input_el.set_indeterminate(false);
+                }
             }
         }
         if spec.input_type == Some("range") || spec.aria_role == Some("spinbutton") {
-            let step_str = spec
-                .numeric_step
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| String::from("any"));
-            input_el.set_step(&step_str);
-            set_optional_attr(
-                element,
-                "min",
-                spec.numeric_min.map(|v| v.to_string()).as_deref(),
-            );
-            set_optional_attr(
-                element,
-                "max",
-                spec.numeric_max.map(|v| v.to_string()).as_deref(),
-            );
+            if old.is_none_or(|o| o.numeric_step != spec.numeric_step) {
+                let step_str = spec
+                    .numeric_step
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| String::from("any"));
+                input_el.set_step(&step_str);
+            }
+            if old.is_none_or(|o| o.numeric_min != spec.numeric_min) {
+                set_optional_attr(
+                    element,
+                    "min",
+                    spec.numeric_min.map(|v| v.to_string()).as_deref(),
+                );
+            }
+            if old.is_none_or(|o| o.numeric_max != spec.numeric_max) {
+                set_optional_attr(
+                    element,
+                    "max",
+                    spec.numeric_max.map(|v| v.to_string()).as_deref(),
+                );
+            }
             if let Some(val) = spec.numeric_value {
                 let s = val.to_string();
                 if input_el.value() != s {
                     input_el.set_value(&s);
                 }
             }
-        } else if !matches!(spec.input_type, Some("checkbox" | "radio")) && !skip_value_sync {
-            let val = spec.value.as_deref().unwrap_or("");
-            if spec.input_type == Some("password") {
-                let current = input_el.value();
-                if current.chars().count() != val.chars().count()
-                    || (val.is_empty() && !current.is_empty())
-                {
-                    input_el.set_value(val);
-                }
-            } else if input_el.value() != val {
-                input_el.set_value(val);
-            }
+        } else if !skip_value_sync {
+            sync_text_element_value(element, spec);
         }
     } else if let Some(textarea_el) = element.dyn_ref::<HtmlTextAreaElement>() {
-        textarea_el.set_disabled(spec.disabled);
-        textarea_el.set_read_only(spec.read_only);
+        if old.is_none_or(|o| o.disabled != spec.disabled) {
+            textarea_el.set_disabled(spec.disabled);
+        }
+        if old.is_none_or(|o| o.read_only != spec.read_only) {
+            textarea_el.set_read_only(spec.read_only);
+        }
         if !skip_value_sync {
-            let val = spec.value.as_deref().unwrap_or("");
-            if textarea_el.value() != val {
-                textarea_el.set_value(val);
-            }
+            sync_text_element_value(element, spec);
         }
     } else if matches!(
         spec.tag,
         DomTag::Span | DomTag::Heading | DomTag::Anchor | DomTag::ListItem
     ) || (spec.tag == DomTag::Button && effective_role == Some("combobox"))
         || (spec.tag == DomTag::Div
-            && matches!(effective_role, Some("option" | "listitem"))
+            && matches!(
+                effective_role,
+                Some(
+                    "option"
+                        | "listitem"
+                        | "treeitem"
+                        | "cell"
+                        | "gridcell"
+                        | "columnheader"
+                        | "rowheader"
+                        | "tooltip"
+                )
+            )
             && element.first_element_child().is_none())
     {
         let text = spec.value.as_deref().or(spec.label.as_deref()).unwrap_or("");
@@ -1416,28 +1914,26 @@ fn apply_dom_attributes(
         }
     }
 
-    apply_bounds(element, spec.bounds, dpr, canvas_origin);
+    if old.is_none_or(|o| o.bounds != spec.bounds) {
+        apply_bounds(element, spec.bounds, scale);
+    }
 }
 
-fn apply_bounds(element: &Element, bounds: Option<Rect>, dpr: f64, canvas_origin: (f64, f64)) {
+fn apply_bounds(element: &Element, bounds: Option<Rect>, scale: (f64, f64)) {
     let Some(html) = element.dyn_ref::<HtmlElement>() else {
         return;
     };
     let style = html.style();
     if let Some(bounds) = bounds {
-        let left = canvas_origin.0 + bounds.x0 / dpr;
-        let top = canvas_origin.1 + bounds.y0 / dpr;
-        let width = (bounds.x1 - bounds.x0).max(0.0) / dpr;
-        let height = (bounds.y1 - bounds.y0).max(0.0) / dpr;
-        let _ = style.set_property("position", "fixed");
+        let left = bounds.x0 * scale.0;
+        let top = bounds.y0 * scale.1;
+        let width = (bounds.x1 - bounds.x0).max(0.0) * scale.0;
+        let height = (bounds.y1 - bounds.y0).max(0.0) * scale.1;
+        let _ = style.set_property("position", "absolute");
         let _ = style.set_property("left", &format!("{left}px"));
         let _ = style.set_property("top", &format!("{top}px"));
         let _ = style.set_property("width", &format!("{width}px"));
         let _ = style.set_property("height", &format!("{height}px"));
-        let _ = style.set_property("margin", "0");
-        let _ = style.set_property("padding", "0");
-        let _ = style.set_property("border", "0");
-        let _ = style.set_property("pointer-events", "none");
     } else {
         let _ = style.remove_property("position");
         let _ = style.remove_property("left");

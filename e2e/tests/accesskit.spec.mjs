@@ -125,11 +125,13 @@ test.describe("egui-web-accesskit E2E", () => {
     await themeCombo.evaluate((el) => el.click());
     await expect(themeCombo).toHaveAttribute("aria-expanded", "false");
 
-    // 2c. Modal AlertDialog + axe-core check while open + close
+    // 2c. Modal AlertDialog + background inert trapping + axe-core check while open + close
     await overlay.getByRole("button", { name: "Open dialog" }).evaluate((el) => el.click());
     const modal = overlay.getByRole("alertdialog", { name: "Confirmation dialog" });
     await expect(modal).toBeAttached();
     await expect(modal).toHaveAttribute("aria-modal", "true");
+    expect(await incBtn.evaluate((el) => el.closest("[inert]") !== null)).toBe(true);
+    expect(await modal.evaluate((el) => el.closest("[inert]") !== null)).toBe(false);
 
     const modalAxe = await new AxeBuilder({ page })
       .include('[data-egui-accesskit="true"]')
@@ -139,6 +141,7 @@ test.describe("egui-web-accesskit E2E", () => {
 
     await overlay.getByRole("button", { name: "Close dialog" }).evaluate((el) => el.click());
     await expect(modal).toHaveCount(0);
+    expect(await incBtn.evaluate((el) => el.closest("[inert]") !== null)).toBe(false);
 
     // 3. Disclosure click & aria-expanded update
     await detailsBtn.evaluate((el) => el.click());
@@ -165,6 +168,37 @@ test.describe("egui-web-accesskit E2E", () => {
     );
     expect(stillFocused).toBe(true);
 
+    await overlay.getByRole("button", { name: "Clear note" }).evaluate((el) =>
+      el.click()
+    );
+    await expect(noteBox).toHaveValue("");
+
+    // 5b. IME composition defers sync until compositionend commits
+    await noteBox.evaluate((el) => {
+      el.focus();
+      el.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+      el.value = "ka";
+      el.dispatchEvent(
+        new InputEvent("input", {
+          bubbles: true,
+          inputType: "insertCompositionText",
+          data: "ka",
+          isComposing: true,
+        })
+      );
+    });
+    const toggleWarningBtn = overlay.getByRole("button", { name: "Toggle warning" });
+    await toggleWarningBtn.evaluate((el) => el.click());
+    await expect(overlay.getByText("Warning banner")).toBeAttached();
+    await expect(noteBox).toHaveValue("ka");
+    await noteBox.evaluate((el) => {
+      el.value = "漢";
+      el.dispatchEvent(
+        new CompositionEvent("compositionend", { bubbles: true, data: "漢" })
+      );
+    });
+    await expect(noteBox).toHaveValue("漢");
+    await toggleWarningBtn.evaluate((el) => el.click());
     await overlay.getByRole("button", { name: "Clear note" }).evaluate((el) =>
       el.click()
     );
@@ -302,6 +336,10 @@ test.describe("egui-web-accesskit E2E", () => {
       boxAfter.y + boxAfter.height / 2
     );
     await expect(overlay.getByText("Button clicked 2 times")).toBeAttached();
+    const activeInsideOverlay = await overlay.evaluate((el) =>
+      el.contains(document.activeElement)
+    );
+    expect(activeInsideOverlay).toBe(false);
 
     expect(errors).toEqual([]);
   });
