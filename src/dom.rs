@@ -414,6 +414,9 @@ pub(crate) struct WebDomBridge {
     modal_return_focus: Option<NodeId>,
     /// Set while focus should move into a newly opened modal once one of its controls is mirrored.
     modal_focus_pending: bool,
+    /// Set when the lazy activation button held focus and was removed, so focus must be
+    /// restored to the first mirrored control once the tree arrives.
+    activation_focus_pending: bool,
     inert_elements: Vec<Element>,
     queue: ActionQueue,
     repaint_wakeup: RepaintWakeup,
@@ -539,6 +542,7 @@ impl WebDomBridge {
             modal_dirty: false,
             modal_return_focus: None,
             modal_focus_pending: false,
+            activation_focus_pending: false,
             inert_elements: Vec::new(),
             queue,
             repaint_wakeup: Rc::new(RefCell::new(Some(wakeup))),
@@ -565,6 +569,12 @@ impl WebDomBridge {
 
     fn take_activation(&mut self, from_dom: bool) -> Option<ActivateCallback> {
         if let Some(btn) = self.activate_button.take() {
+            // Removing a focused element drops focus to `document.body`; remember to restore it.
+            if active_element_for(self.container.as_ref(), &self.document)
+                .is_some_and(|active| active == btn)
+            {
+                self.activation_focus_pending = true;
+            }
             btn.remove();
         }
         if self.activated {
@@ -1063,6 +1073,9 @@ impl WebDomBridge {
             .filter(|active| self.container.contains(Some(active.as_ref())))
             .and_then(|el| parse_node_id(&el));
         let had_modal = !self.modal_nodes.is_empty();
+        if self.activation_focus_pending {
+            self.settle_activation_focus();
+        }
 
         let (scale, scale_changed) = self.sync_viewport();
         let TreeDelta {
@@ -1129,6 +1142,32 @@ impl WebDomBridge {
             self.reapply_all_bounds(scale);
         }
         self.dom_action_in_flight = false;
+    }
+
+    /// Moves focus off `document.body` after the lazy activation button was removed while it had
+    /// focus: to the first mirrored control, or the root region when there is none yet.
+    fn settle_activation_focus(&mut self) {
+        let active = active_element_for(self.container.as_ref(), &self.document);
+        if active
+            .as_ref()
+            .is_some_and(|el| self.container.contains(Some(el.as_ref())))
+        {
+            self.activation_focus_pending = false;
+            return;
+        }
+        let target = first_focusable_within(&self.container).or_else(|| {
+            let root = self.elements.get(&self.tree.root_id()?)?.clone();
+            let _ = root.set_attribute("tabindex", "-1");
+            Some(root)
+        });
+        let Some(target) = target else {
+            return;
+        };
+        self.activation_focus_pending = false;
+        self.focus_element(&target);
+        if let Some(id) = parse_node_id(&target) {
+            push_action(&self.queue, &self.repaint_wakeup, focus_action(id));
+        }
     }
 
     /// Records that a modal opened from a DOM-driven action (keyboard or a focused control), so

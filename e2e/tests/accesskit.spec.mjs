@@ -520,6 +520,35 @@ test.describe("egui-web-accesskit E2E", () => {
     expect(errors).toEqual([]);
   });
 
+  test("keyboard focus on the lazy activation button moves into the mirror instead of document.body", async ({
+    page,
+  }) => {
+    const errors = [];
+    page.on("pageerror", (err) => errors.push(err.message));
+
+    await page.goto("/?lazy=1");
+    const overlay = page.locator('[data-egui-accesskit="true"]');
+    const activateBtn = overlay.locator("[data-egui-accesskit-activate]");
+    await expect(activateBtn).toBeAttached({ timeout: 15000 });
+
+    // Focusing the activation button activates the mirror and removes that button.
+    await activateBtn.focus();
+    await expect(activateBtn).toHaveCount(0);
+    await expect(overlay.getByRole("button", { name: "Increment counter" })).toBeAttached({
+      timeout: 15000,
+    });
+
+    await expect
+      .poll(() =>
+        page.evaluate(() => {
+          const overlayEl = document.querySelector('[data-egui-accesskit="true"]');
+          return overlayEl !== null && overlayEl.contains(document.activeElement);
+        })
+      )
+      .toBe(true);
+    expect(errors).toEqual([]);
+  });
+
   test("supports lazy activation via WebAccessKitPlugin::new_lazy", async ({ page }) => {
     const errors = [];
     page.on("pageerror", (err) => errors.push(err.message));
