@@ -147,8 +147,7 @@ impl eframe::App for DemoApp {
                         let note_resp = ui
                             .add(egui::TextEdit::singleline(&mut self.note).id(note_id))
                             .labelled_by(label.id);
-                        if note_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                        {
+                        if note_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             self.note_submitted += 1;
                         }
                         if ui.button("Clear note").clicked() {
@@ -252,8 +251,12 @@ impl eframe::App for DemoApp {
                 scoped_row(&mut cols[1], "retries_row", |ui| {
                     ui.horizontal(|ui| {
                         let lbl = ui.label("Retries:");
-                        ui.add(egui::DragValue::new(&mut self.retries).range(0..=10).speed(1.0))
-                            .labelled_by(lbl.id);
+                        ui.add(
+                            egui::DragValue::new(&mut self.retries)
+                                .range(0..=10)
+                                .speed(1.0),
+                        )
+                        .labelled_by(lbl.id);
                     });
                 });
 
@@ -335,9 +338,7 @@ fn main() {
                 .append_child(&host)
                 .expect("append shadow host");
             let shadow = host
-                .attach_shadow(&web_sys::ShadowRootInit::new(
-                    web_sys::ShadowRootMode::Open,
-                ))
+                .attach_shadow(&web_sys::ShadowRootInit::new(web_sys::ShadowRootMode::Open))
                 .expect("attach shadow root");
             let _ = canvas.set_attribute("style", "width: 100%; height: 100%; display: block;");
             shadow

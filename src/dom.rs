@@ -583,9 +583,11 @@ impl WebDomBridge {
         self.resize_observer = None;
 
         let window_target: web_sys::EventTarget = self.window.clone().into();
-        if let Some(l) = add_listener_with_options(&window_target, "scroll", true, true, move |_| {
-            try_with_bridge_mut(id, Self::realign_viewport);
-        }) {
+        if let Some(l) =
+            add_listener_with_options(&window_target, "scroll", true, true, move |_| {
+                try_with_bridge_mut(id, Self::realign_viewport);
+            })
+        {
             self.viewport_listeners.push(l);
         }
         if let Some(l) =
@@ -620,8 +622,7 @@ impl WebDomBridge {
                 if syncing_focus.get() {
                     return;
                 }
-                let Some(target) = event.target().and_then(|t| t.dyn_into::<Element>().ok())
-                else {
+                let Some(target) = event.target().and_then(|t| t.dyn_into::<Element>().ok()) else {
                     return;
                 };
                 if target.has_attribute("data-egui-accesskit-activate") {
@@ -694,8 +695,12 @@ impl WebDomBridge {
         }
 
         // 3. BeforeInput delegation (password snapshot before edits).
-        if let Some(l) =
-            add_listener_with_options(&container_target, "beforeinput", false, true, move |event| {
+        if let Some(l) = add_listener_with_options(
+            &container_target,
+            "beforeinput",
+            false,
+            true,
+            move |event| {
                 let Some((target, node_id)) = event_node_target(&event) else {
                     return;
                 };
@@ -709,8 +714,8 @@ impl WebDomBridge {
                         bridge.password_prev.insert(node_id, val);
                     }
                 });
-            })
-        {
+            },
+        ) {
             self.viewport_listeners.push(l);
         }
 
@@ -765,7 +770,11 @@ impl WebDomBridge {
                             bridge.password_prev.get(&node_id).cloned(),
                         ))),
                         InteractionKind::Numeric { .. } => {
-                            let val = target.dyn_ref::<HtmlInputElement>()?.value().parse::<f64>().ok()?;
+                            let val = target
+                                .dyn_ref::<HtmlInputElement>()?
+                                .value()
+                                .parse::<f64>()
+                                .ok()?;
                             Some(Err(val))
                         }
                         _ => None,
@@ -941,10 +950,9 @@ impl WebDomBridge {
                 && let Some(current) = event.target().and_then(|t| t.dyn_into::<Element>().ok())
             {
                 let backwards = kb.shift_key();
-                let next = try_with_bridge_mut(id, |bridge| {
-                    bridge.modal_tab_target(&current, backwards)
-                })
-                .flatten();
+                let next =
+                    try_with_bridge_mut(id, |bridge| bridge.modal_tab_target(&current, backwards))
+                        .flatten();
                 if let Some(next) = next {
                     event.prevent_default();
                     event.stop_propagation();
@@ -1821,7 +1829,9 @@ fn read_text_value(element: &Element) -> Option<String> {
     if let Some(input) = element.dyn_ref::<HtmlInputElement>() {
         Some(input.value())
     } else {
-        element.dyn_ref::<HtmlTextAreaElement>().map(|ta| ta.value())
+        element
+            .dyn_ref::<HtmlTextAreaElement>()
+            .map(|ta| ta.value())
     }
 }
 
@@ -1873,7 +1883,9 @@ fn write_dom_selection(
     if let Some((Some(cur_start), Some(cur_end), cur_dir)) = selection_fields(element)
         && cur_start == start
         && cur_end == end
-        && cur_dir.as_deref().is_some_and(|d| (d == "backward") == backward)
+        && cur_dir
+            .as_deref()
+            .is_some_and(|d| (d == "backward") == backward)
     {
         return;
     }
@@ -2313,10 +2325,7 @@ fn apply_dom_attributes(
         }
     }
 
-    if hoisted.is_some()
-        || role_changed
-        || old.is_none_or(|o| o.expanded != spec.expanded)
-    {
+    if hoisted.is_some() || role_changed || old.is_none_or(|o| o.expanded != spec.expanded) {
         sync_disclosure_attrs(element, spec, hoisted, bridge_id);
     }
 
@@ -2497,7 +2506,11 @@ fn apply_dom_attributes(
             )
             && element.first_element_child().is_none())
     {
-        let text = spec.value.as_deref().or(spec.label.as_deref()).unwrap_or("");
+        let text = spec
+            .value
+            .as_deref()
+            .or(spec.label.as_deref())
+            .unwrap_or("");
         if element.text_content().as_deref() != Some(text) {
             element.set_text_content(Some(text));
         }
@@ -2599,11 +2612,7 @@ fn add_listener_with_options(
     })
 }
 
-fn push_action(
-    queue: &ActionQueue,
-    wakeup: &RepaintWakeup,
-    request: ActionRequest,
-) {
+fn push_action(queue: &ActionQueue, wakeup: &RepaintWakeup, request: ActionRequest) {
     push_events(queue, wakeup, [PendingDomEvent::Action(request)]);
 }
 

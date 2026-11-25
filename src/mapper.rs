@@ -271,9 +271,7 @@ pub fn map_node(node: &NodeRef<'_>) -> DomNodeSpec {
     let description = node.description().filter(|s| !s.is_empty());
     // `value()` skips text-range extraction on multiline text inputs, so
     // fall back to the raw value string when present.
-    let value = node
-        .value()
-        .or_else(|| node.raw_value().map(str::to_owned));
+    let value = node.value().or_else(|| node.raw_value().map(str::to_owned));
     let placeholder = node
         .data()
         .placeholder()
@@ -319,9 +317,7 @@ pub fn map_node(node: &NodeRef<'_>) -> DomNodeSpec {
         numeric_max: node.max_numeric_value(),
         numeric_step: node.numeric_value_step(),
         text_selection,
-        bounds: (!node.is_hidden())
-            .then(|| node.bounding_box())
-            .flatten(),
+        bounds: (!node.is_hidden()).then(|| node.bounding_box()).flatten(),
         required: data.is_required(),
         invalid: data.invalid(),
         error_message: data.error_message(),
@@ -354,9 +350,8 @@ fn has_any_ancestor(node: &NodeRef<'_>, targets: &[Role]) -> bool {
 }
 
 fn has_descendant(node: &NodeRef<'_>, pred: &impl Fn(&NodeRef<'_>) -> bool) -> bool {
-    node.children().any(|child| {
-        !should_skip_node(&child) && (pred(&child) || has_descendant(&child, pred))
-    })
+    node.children()
+        .any(|child| !should_skip_node(&child) && (pred(&child) || has_descendant(&child, pred)))
 }
 
 fn map_role(role: Role) -> (DomTag, Option<&'static str>, Option<&'static str>) {
@@ -468,7 +463,9 @@ impl TreeBridge {
 
     /// Root node ID of the retained tree, if initialized.
     pub fn root_id(&self) -> Option<NodeId> {
-        self.tree.as_ref().map(|tree| tree.state().root().locate().0)
+        self.tree
+            .as_ref()
+            .map(|tree| tree.state().root().locate().0)
     }
 
     /// Currently focused node ID in the retained tree, if initialized.
@@ -493,7 +490,12 @@ impl TreeBridge {
                 + delta.removals.len()
                 + usize::from(delta.focus_change.is_some()),
         );
-        ops.extend(delta.upserts.into_iter().map(|(_, spec)| DomOp::Upsert(spec)));
+        ops.extend(
+            delta
+                .upserts
+                .into_iter()
+                .map(|(_, spec)| DomOp::Upsert(spec)),
+        );
         ops.extend(
             delta
                 .children_ops
@@ -611,7 +613,10 @@ impl TreeBridge {
             action: Action::SetTextSelection,
             target_tree: TreeId::ROOT,
             target_node,
-            data: Some(ActionData::SetTextSelection(TextSelection { anchor, focus })),
+            data: Some(ActionData::SetTextSelection(TextSelection {
+                anchor,
+                focus,
+            })),
         })
     }
 }
@@ -970,9 +975,8 @@ mod tests {
             let _ = ui.add_enabled(false, egui::Button::new("Locked action"));
             let _ = ui.add(egui::DragValue::new(&mut retries).range(0..=10).speed(1.0));
             let _ = ui.add(egui::ProgressBar::new(0.75).text("Sync progress"));
-            egui::ComboBox::from_label("Theme").show_index(ui, &mut choice, 2, |i| {
-                ["Dark", "Light"][i]
-            });
+            egui::ComboBox::from_label("Theme")
+                .show_index(ui, &mut choice, 2, |i| ["Dark", "Light"][i]);
             let _ = &mut muted;
         });
 
@@ -1343,9 +1347,9 @@ mod tests {
         let bottom = find_upsert(&ops1, |s| s.label.as_deref() == Some("Bottom target"));
 
         let input2 = egui::RawInput {
-            events: vec![egui::Event::AccessKitActionRequest(scroll_into_view_action(
-                bottom.id,
-            ))],
+            events: vec![egui::Event::AccessKitActionRequest(
+                scroll_into_view_action(bottom.id),
+            )],
             ..Default::default()
         };
         let mut out2 = ctx.run_ui(input2, show_scroll_ui);
@@ -1438,7 +1442,10 @@ mod tests {
         let mut bridge = TreeBridge::new();
         let ops = bridge.apply_update(update);
 
-        assert_eq!(find_upsert(&ops, |s| s.id == grid_id).aria_role, Some("grid"));
+        assert_eq!(
+            find_upsert(&ops, |s| s.id == grid_id).aria_role,
+            Some("grid")
+        );
         assert_eq!(find_upsert(&ops, |s| s.id == row_id).aria_role, Some("row"));
         assert_eq!(
             find_upsert(&ops, |s| s.id == hdr_id).aria_role,
@@ -1448,22 +1455,34 @@ mod tests {
             find_upsert(&ops, |s| s.id == cell_id).aria_role,
             Some("gridcell")
         );
-        assert_eq!(find_upsert(&ops, |s| s.id == tree_id).aria_role, Some("tree"));
+        assert_eq!(
+            find_upsert(&ops, |s| s.id == tree_id).aria_role,
+            Some("tree")
+        );
         assert_eq!(
             find_upsert(&ops, |s| s.id == tree_item_id).aria_role,
             Some("treeitem")
         );
-        assert_eq!(find_upsert(&ops, |s| s.id == menu_id).aria_role, Some("menu"));
+        assert_eq!(
+            find_upsert(&ops, |s| s.id == menu_id).aria_role,
+            Some("menu")
+        );
         assert_eq!(
             find_upsert(&ops, |s| s.id == menu_item_id).aria_role,
             Some("menuitem")
         );
-        assert_eq!(find_upsert(&ops, |s| s.id == orphan_cell_id).aria_role, None);
+        assert_eq!(
+            find_upsert(&ops, |s| s.id == orphan_cell_id).aria_role,
+            None
+        );
         assert_eq!(
             find_upsert(&ops, |s| s.id == empty_tree_id).aria_role,
             Some("group")
         );
-        assert_eq!(find_upsert(&ops, |s| s.id == unlabelled_img_id).aria_role, None);
+        assert_eq!(
+            find_upsert(&ops, |s| s.id == unlabelled_img_id).aria_role,
+            None
+        );
     }
 
     #[test]
@@ -1476,7 +1495,8 @@ mod tests {
         let mut out1 = ctx.run_ui(egui::RawInput::default(), |ui| {
             ui.checkbox(&mut checked, "Agree");
         });
-        let delta1 = bridge.apply_update_diff(out1.platform_output.accesskit_update.take().unwrap());
+        let delta1 =
+            bridge.apply_update_diff(out1.platform_output.accesskit_update.take().unwrap());
         out1.drop_without_applying_deltas();
         assert_eq!(bridge.focused_id(), bridge.root_id());
 
@@ -1503,7 +1523,8 @@ mod tests {
                 ui.checkbox(&mut checked, "Agree");
             },
         );
-        let delta2 = bridge.apply_update_diff(out2.platform_output.accesskit_update.take().unwrap());
+        let delta2 =
+            bridge.apply_update_diff(out2.platform_output.accesskit_update.take().unwrap());
         out2.drop_without_applying_deltas();
 
         assert_eq!(bridge.focused_id(), Some(cb_id));
@@ -1673,7 +1694,13 @@ mod tests {
                 ui.add(egui::TextEdit::singleline(&mut secret).password(true));
             },
         );
-        let _ = bridge.apply_update(out_pw_focus.platform_output.accesskit_update.take().unwrap());
+        let _ = bridge.apply_update(
+            out_pw_focus
+                .platform_output
+                .accesskit_update
+                .take()
+                .unwrap(),
+        );
         out_pw_focus.drop_without_applying_deltas();
 
         let out_pw_edit = ctx.run_ui(
