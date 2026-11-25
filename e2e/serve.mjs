@@ -16,7 +16,11 @@ const server = http.createServer((req, res) => {
   const urlPath = (req.url || "/").split("?")[0];
   const rel = urlPath === "/" ? "index.html" : urlPath.replace(/^\/+/, "");
   const filePath = path.resolve(dir, rel);
-  if (!filePath.startsWith(dir) || !fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
+  if (
+    !filePath.startsWith(dir) ||
+    !fs.existsSync(filePath) ||
+    fs.statSync(filePath).isDirectory()
+  ) {
     res.writeHead(404).end("Not found");
     return;
   }

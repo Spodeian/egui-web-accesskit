@@ -7,8 +7,8 @@ use std::collections::HashMap;
 
 use accesskit_consumer::{FilterResult, Node, Tree, TreeChangeHandler};
 use egui::accesskit::{
-    Action, ActionData, ActionRequest, Invalid, Live, NodeId, Orientation, Rect, Role,
-    TextSelection, Toggled, TreeId, TreeUpdate,
+    Action, ActionData, ActionRequest, AutoComplete, Invalid, Live, NodeId, Orientation, Rect,
+    Role, TextSelection, Toggled, TreeId, TreeUpdate,
 };
 use egui::{Event, Key, Modifiers};
 
@@ -130,6 +130,9 @@ pub struct DomNodeSpec {
     pub row_index: Option<usize>,
     /// 0-based column index (`aria-colindex` emits `+ 1`).
     pub column_index: Option<usize>,
+    /// Autocomplete behaviour (`aria-autocomplete`). `None` unless the application explicitly
+    /// set an AccessKit autocomplete mode, so plain text fields never advertise autocomplete.
+    pub auto_complete: Option<&'static str>,
 }
 
 /// Incremental DOM mutation produced by [`TreeBridge::apply_update`].
@@ -268,9 +271,7 @@ pub fn map_node(node: &Node<'_>) -> DomNodeSpec {
     let description = node.description().filter(|s| !s.is_empty());
     // `value()` skips text-range extraction on multiline text inputs, so
     // fall back to the raw value string when present.
-    let value = node
-        .value()
-        .or_else(|| node.raw_value().map(str::to_owned));
+    let value = node.value().or_else(|| node.raw_value().map(str::to_owned));
     let placeholder = node
         .data()
         .placeholder()
@@ -316,9 +317,7 @@ pub fn map_node(node: &Node<'_>) -> DomNodeSpec {
         numeric_max: node.max_numeric_value(),
         numeric_step: node.numeric_value_step(),
         text_selection,
-        bounds: (!node.is_hidden())
-            .then(|| node.bounding_box())
-            .flatten(),
+        bounds: (!node.is_hidden()).then(|| node.bounding_box()).flatten(),
         required: data.is_required(),
         invalid: data.invalid(),
         error_message: data.error_message(),
@@ -331,6 +330,11 @@ pub fn map_node(node: &Node<'_>) -> DomNodeSpec {
         column_count: data.column_count(),
         row_index: data.row_index(),
         column_index: data.column_index(),
+        auto_complete: data.auto_complete().map(|mode| match mode {
+            AutoComplete::Inline => "inline",
+            AutoComplete::List => "list",
+            AutoComplete::Both => "both",
+        }),
     }
 }
 
@@ -346,9 +350,8 @@ fn has_any_ancestor(node: &Node<'_>, targets: &[Role]) -> bool {
 }
 
 fn has_descendant(node: &Node<'_>, pred: &impl Fn(&Node<'_>) -> bool) -> bool {
-    node.children().any(|child| {
-        !should_skip_node(&child) && (pred(&child) || has_descendant(&child, pred))
-    })
+    node.children()
+        .any(|child| !should_skip_node(&child) && (pred(&child) || has_descendant(&child, pred)))
 }
 
 fn map_role(role: Role) -> (DomTag, Option<&'static str>, Option<&'static str>) {
@@ -460,7 +463,9 @@ impl TreeBridge {
 
     /// Root node ID of the retained tree, if initialized.
     pub fn root_id(&self) -> Option<NodeId> {
-        self.tree.as_ref().map(|tree| tree.state().root().locate().0)
+        self.tree
+            .as_ref()
+            .map(|tree| tree.state().root().locate().0)
     }
 
     /// Currently focused node ID in the retained tree, if initialized.
@@ -485,7 +490,12 @@ impl TreeBridge {
                 + delta.removals.len()
                 + usize::from(delta.focus_change.is_some()),
         );
-        ops.extend(delta.upserts.into_iter().map(|(_, spec)| DomOp::Upsert(spec)));
+        ops.extend(
+            delta
+                .upserts
+                .into_iter()
+                .map(|(_, spec)| DomOp::Upsert(spec)),
+        );
         ops.extend(
             delta
                 .children_ops
@@ -603,7 +613,10 @@ impl TreeBridge {
             action: Action::SetTextSelection,
             target_tree: TreeId::ROOT,
             target_node,
-            data: Some(ActionData::SetTextSelection(TextSelection { anchor, focus })),
+            data: Some(ActionData::SetTextSelection(TextSelection {
+                anchor,
+                focus,
+            })),
         })
     }
 }
@@ -960,9 +973,8 @@ mod tests {
             let _ = ui.add_enabled(false, egui::Button::new("Locked action"));
             let _ = ui.add(egui::DragValue::new(&mut retries).range(0..=10).speed(1.0));
             let _ = ui.add(egui::ProgressBar::new(0.75).text("Sync progress"));
-            egui::ComboBox::from_label("Theme").show_index(ui, &mut choice, 2, |i| {
-                ["Dark", "Light"][i]
-            });
+            egui::ComboBox::from_label("Theme")
+                .show_index(ui, &mut choice, 2, |i| ["Dark", "Light"][i]);
             let _ = &mut muted;
         });
 
@@ -1370,7 +1382,10 @@ mod tests {
         let mut bridge = TreeBridge::new();
         let ops = bridge.apply_update(update);
 
-        assert_eq!(find_upsert(&ops, |s| s.id == grid_id).aria_role, Some("grid"));
+        assert_eq!(
+            find_upsert(&ops, |s| s.id == grid_id).aria_role,
+            Some("grid")
+        );
         assert_eq!(find_upsert(&ops, |s| s.id == row_id).aria_role, Some("row"));
         assert_eq!(
             find_upsert(&ops, |s| s.id == hdr_id).aria_role,
@@ -1380,22 +1395,34 @@ mod tests {
             find_upsert(&ops, |s| s.id == cell_id).aria_role,
             Some("gridcell")
         );
-        assert_eq!(find_upsert(&ops, |s| s.id == tree_id).aria_role, Some("tree"));
+        assert_eq!(
+            find_upsert(&ops, |s| s.id == tree_id).aria_role,
+            Some("tree")
+        );
         assert_eq!(
             find_upsert(&ops, |s| s.id == tree_item_id).aria_role,
             Some("treeitem")
         );
-        assert_eq!(find_upsert(&ops, |s| s.id == menu_id).aria_role, Some("menu"));
+        assert_eq!(
+            find_upsert(&ops, |s| s.id == menu_id).aria_role,
+            Some("menu")
+        );
         assert_eq!(
             find_upsert(&ops, |s| s.id == menu_item_id).aria_role,
             Some("menuitem")
         );
-        assert_eq!(find_upsert(&ops, |s| s.id == orphan_cell_id).aria_role, None);
+        assert_eq!(
+            find_upsert(&ops, |s| s.id == orphan_cell_id).aria_role,
+            None
+        );
         assert_eq!(
             find_upsert(&ops, |s| s.id == empty_tree_id).aria_role,
             Some("group")
         );
-        assert_eq!(find_upsert(&ops, |s| s.id == unlabelled_img_id).aria_role, None);
+        assert_eq!(
+            find_upsert(&ops, |s| s.id == unlabelled_img_id).aria_role,
+            None
+        );
     }
 
     #[test]
@@ -1408,7 +1435,8 @@ mod tests {
         let mut out1 = ctx.run_ui(egui::RawInput::default(), |ui| {
             ui.checkbox(&mut checked, "Agree");
         });
-        let delta1 = bridge.apply_update_diff(out1.platform_output.accesskit_update.take().unwrap());
+        let delta1 =
+            bridge.apply_update_diff(out1.platform_output.accesskit_update.take().unwrap());
         assert_eq!(bridge.focused_id(), bridge.root_id());
 
         let cb_id = delta1
@@ -1434,7 +1462,8 @@ mod tests {
                 ui.checkbox(&mut checked, "Agree");
             },
         );
-        let delta2 = bridge.apply_update_diff(out2.platform_output.accesskit_update.take().unwrap());
+        let delta2 =
+            bridge.apply_update_diff(out2.platform_output.accesskit_update.take().unwrap());
 
         assert_eq!(bridge.focused_id(), Some(cb_id));
         let (old, spec) = delta2
@@ -1466,6 +1495,7 @@ mod tests {
         input.set_invalid(Invalid::Spelling);
         input.set_error_message(err_id);
         input.set_described_by(vec![desc_id]);
+        input.set_auto_complete(AutoComplete::List);
 
         let mut err = egui::accesskit::Node::new(Role::Label);
         err.set_value("Invalid spelling");
@@ -1518,6 +1548,10 @@ mod tests {
         assert_eq!(input_spec.invalid, Some(Invalid::Spelling));
         assert_eq!(input_spec.error_message, Some(err_id));
         assert_eq!(input_spec.described_by, vec![desc_id]);
+        assert_eq!(input_spec.auto_complete, Some("list"));
+
+        let err_spec = find_upsert(&ops, |s| s.id == err_id);
+        assert_eq!(err_spec.auto_complete, None);
 
         let list_spec = find_upsert(&ops, |s| s.id == list_id);
         assert_eq!(list_spec.orientation, Some(Orientation::Vertical));
@@ -1595,7 +1629,13 @@ mod tests {
                 ui.add(egui::TextEdit::singleline(&mut secret).password(true));
             },
         );
-        let _ = bridge.apply_update(out_pw_focus.platform_output.accesskit_update.take().unwrap());
+        let _ = bridge.apply_update(
+            out_pw_focus
+                .platform_output
+                .accesskit_update
+                .take()
+                .unwrap(),
+        );
 
         let _ = ctx.run_ui(
             egui::RawInput {
