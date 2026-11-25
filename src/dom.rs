@@ -151,6 +151,10 @@ pub(crate) fn drain_pending_events(
         let mut deferred = Vec::new();
 
         for event in drained {
+            if !deferred.is_empty() {
+                deferred.push(event);
+                continue;
+            }
             match event {
                 PendingDomEvent::Action(req) => {
                     if req.action == Action::Focus {
