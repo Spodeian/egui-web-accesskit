@@ -1,12 +1,22 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test } from "@playwright/test";
 
+/** Waits for two animation frames, so any DOM mutation caused by the last input has run. */
+async function settleFrames(page) {
+  await page.evaluate(
+    () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+  );
+}
+
 test.describe("egui-web-accesskit E2E", () => {
   test("mirrors widgets, passes axe-core ARIA checks, routes DOM/keyboard/password/scroll interactions, preserves focus, and tracks zoom", async ({
     page,
   }) => {
     const errors = [];
     page.on("pageerror", (err) => errors.push(err.message));
+    page.on("console", (msg) => {
+      if (msg.type() === "error") errors.push(msg.text());
+    });
 
     await page.goto("/");
 
@@ -49,10 +59,7 @@ test.describe("egui-web-accesskit E2E", () => {
     await expect(moreHeading).toHaveAttribute("aria-level", "2");
     await expect(liveStatus).toHaveText("Audio active");
     await expect(incBtn).toBeAttached();
-    await expect(incBtn).toHaveAttribute(
-      "aria-description",
-      "Adds one to the click counter"
-    );
+    await expect(incBtn).toHaveAttribute("aria-description", "Adds one to the click counter");
     await expect(notifyCheckbox).toHaveAttribute("aria-checked", "false");
     await expect(triCheckbox).toHaveAttribute("aria-checked", "mixed");
     await expect(opacitySlider).toHaveAttribute("step", "any");
@@ -158,9 +165,7 @@ test.describe("egui-web-accesskit E2E", () => {
     // 4. Unstepped float slider preserves 0.35 and steps on ArrowRight
     await opacitySlider.focus();
     await page.keyboard.press("ArrowRight");
-    await expect
-      .poll(async () => Number(await opacitySlider.inputValue()))
-      .toBeGreaterThan(0.35);
+    await expect.poll(async () => Number(await opacitySlider.inputValue())).toBeGreaterThan(0.35);
 
     // 5. Sibling insertion above focused textbox keeps DOM focus, and clear resets value
     await noteBox.evaluate((el) => {
@@ -170,17 +175,13 @@ test.describe("egui-web-accesskit E2E", () => {
     await page.keyboard.type("!hello");
     await expect(overlay.getByText("Warning banner")).toBeAttached();
     await expect(noteBox).toHaveValue("!hello");
-    const stillFocused = await noteBox.evaluate(
-      (el) => el === document.activeElement
-    );
+    const stillFocused = await noteBox.evaluate((el) => el === document.activeElement);
     expect(stillFocused).toBe(true);
 
     await page.keyboard.press("Enter");
     await expect(overlay.getByText("Note submits: 1")).toBeAttached();
 
-    await overlay.getByRole("button", { name: "Clear note" }).evaluate((el) =>
-      el.click()
-    );
+    await overlay.getByRole("button", { name: "Clear note" }).evaluate((el) => el.click());
     await expect(noteBox).toHaveValue("");
 
     // 5b. IME composition defers sync until compositionend commits
@@ -203,15 +204,11 @@ test.describe("egui-web-accesskit E2E", () => {
     await expect(noteBox).toHaveValue("ka");
     await noteBox.evaluate((el) => {
       el.value = "漢";
-      el.dispatchEvent(
-        new CompositionEvent("compositionend", { bubbles: true, data: "漢" })
-      );
+      el.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "漢" }));
     });
     await expect(noteBox).toHaveValue("漢");
     await toggleWarningBtn.evaluate((el) => el.click());
-    await overlay.getByRole("button", { name: "Clear note" }).evaluate((el) =>
-      el.click()
-    );
+    await overlay.getByRole("button", { name: "Clear note" }).evaluate((el) => el.click());
     await expect(noteBox).toHaveValue("");
 
     // 6. Multiline <textarea>, placeholder, selection sync, read-only input, and ScrollIntoView
@@ -231,11 +228,10 @@ test.describe("egui-web-accesskit E2E", () => {
       el.setSelectionRange(0, 6);
       el.dispatchEvent(new Event("select"));
     });
-    await page.waitForTimeout(150);
-    const selRange = await bioBox.evaluate((el) => [
-      el.selectionStart,
-      el.selectionEnd,
-    ]);
+    await expect
+      .poll(() => bioBox.evaluate((el) => [el.selectionStart, el.selectionEnd]))
+      .toEqual([0, 6]);
+    const selRange = await bioBox.evaluate((el) => [el.selectionStart, el.selectionEnd]);
     expect(selRange).toEqual([0, 6]);
 
     const tokenBox = overlay.getByLabel("Token:");
@@ -328,9 +324,7 @@ test.describe("egui-web-accesskit E2E", () => {
     const boxBefore = await incBtn.boundingBox();
     expect(boxBefore).not.toBeNull();
 
-    await overlay.getByRole("button", { name: "Zoom 1.5x" }).evaluate((el) =>
-      el.click()
-    );
+    await overlay.getByRole("button", { name: "Zoom 1.5x" }).evaluate((el) => el.click());
 
     await expect
       .poll(async () => {
@@ -341,24 +335,342 @@ test.describe("egui-web-accesskit E2E", () => {
 
     const boxAfter = await incBtn.boundingBox();
     expect(boxAfter).not.toBeNull();
-    await page.mouse.click(
-      boxAfter.x + boxAfter.width / 2,
-      boxAfter.y + boxAfter.height / 2
-    );
+    await page.mouse.click(boxAfter.x + boxAfter.width / 2, boxAfter.y + boxAfter.height / 2);
     await expect(overlay.getByText("Button clicked 2 times")).toBeAttached();
-    const activeInsideOverlay = await overlay.evaluate((el) =>
-      el.contains(document.activeElement)
-    );
+    const activeInsideOverlay = await overlay.evaluate((el) => el.contains(document.activeElement));
     expect(activeInsideOverlay).toBe(false);
 
     expect(errors).toEqual([]);
   });
 
-  test("supports Shadow DOM via WebAccessKitPlugin::from_canvas", async ({
+  test("keyboard Enter/Space opens a dialog, keeps focus inside it, traps Tab, and restores focus on Escape", async ({
     page,
   }) => {
     const errors = [];
     page.on("pageerror", (err) => errors.push(err.message));
+    page.on("console", (msg) => {
+      if (msg.type() === "error") errors.push(msg.text());
+    });
+
+    await page.goto("/");
+    const overlay = page.locator('[data-egui-accesskit="true"]');
+    await expect(overlay).toBeAttached({ timeout: 15000 });
+
+    const trigger = overlay.getByRole("button", { name: "Open dialog" });
+    const modal = overlay.getByRole("alertdialog", { name: "Confirmation dialog" });
+    const closeBtn = overlay.getByRole("button", { name: "Close dialog" });
+    const incBtn = overlay.getByRole("button", { name: "Increment counter" });
+
+    for (const key of ["Enter", "Space"]) {
+      await trigger.focus();
+      await expect(trigger).toBeFocused();
+      await page.keyboard.press(key);
+
+      // Focus must move into the dialog instead of falling back to document.body.
+      await expect(modal).toBeAttached();
+      await expect(closeBtn).toBeFocused();
+      expect(await incBtn.evaluate((el) => el.closest("[inert]") !== null)).toBe(true);
+
+      // Tab walks Close -> Cancel -> Confirm and wraps inside the dialog; Shift+Tab walks back.
+      await page.keyboard.press("Tab");
+      await expect(overlay.getByRole("button", { name: "Cancel" })).toBeFocused();
+      await page.keyboard.press("Tab");
+      await expect(overlay.getByRole("button", { name: "Confirm action" })).toBeFocused();
+      await page.keyboard.press("Tab");
+      await expect(closeBtn).toBeFocused();
+      await page.keyboard.press("Shift+Tab");
+      await expect(overlay.getByRole("button", { name: "Confirm action" })).toBeFocused();
+
+      // Escape closes the dialog, returns focus to the opener, and clears the inert background.
+      await page.keyboard.press("Escape");
+      await expect(modal).toHaveCount(0);
+      await expect(trigger).toBeFocused();
+      expect(await incBtn.evaluate((el) => el.closest("[inert]") !== null)).toBe(false);
+    }
+
+    expect(errors).toEqual([]);
+  });
+
+  test("text edits do not rewrite the accessible name, so Backspace is silent once the field is empty", async ({
+    page,
+  }) => {
+    const errors = [];
+    page.on("pageerror", (err) => errors.push(err.message));
+    page.on("console", (msg) => {
+      if (msg.type() === "error") errors.push(msg.text());
+    });
+
+    await page.goto("/");
+    const overlay = page.locator('[data-egui-accesskit="true"]');
+    await expect(overlay).toBeAttached({ timeout: 15000 });
+
+    const noteBox = overlay.getByRole("textbox", { name: "Note:" });
+    await overlay.getByRole("button", { name: "Clear note" }).evaluate((el) => el.click());
+    await expect(noteBox).toHaveValue("");
+
+    await noteBox.focus();
+    await page.evaluate(() => {
+      window.__inputAttrMutations = [];
+      const input = document.querySelector(
+        '[data-egui-accesskit="true"] input[aria-label="Note:"]'
+      );
+      window.__noteInput = input;
+      const observer = new MutationObserver((records) => {
+        for (const record of records) {
+          if (record.target === input) {
+            window.__inputAttrMutations.push(record.attributeName);
+          }
+        }
+      });
+      observer.observe(document.querySelector('[data-egui-accesskit="true"]'), {
+        attributes: true,
+        subtree: true,
+      });
+      window.__noteObserver = observer;
+    });
+
+    await page.keyboard.type("ab");
+    await expect(noteBox).toHaveValue("ab");
+    await page.keyboard.press("Backspace");
+    await expect(noteBox).toHaveValue("a");
+    await page.keyboard.press("Backspace");
+    await expect(noteBox).toHaveValue("");
+    await page.keyboard.press("Backspace");
+    await expect(noteBox).toHaveValue("");
+    await settleFrames(page);
+
+    const mutations = await page.evaluate(() => {
+      window.__noteObserver.disconnect();
+      return window.__inputAttrMutations;
+    });
+    expect(mutations).toEqual([]);
+
+    expect(errors).toEqual([]);
+  });
+
+  test("password field exposes one mask glyph per character and never plaintext", async ({
+    page,
+    browserName,
+  }) => {
+    const errors = [];
+    page.on("pageerror", (err) => errors.push(err.message));
+    page.on("console", (msg) => {
+      if (msg.type() === "error") errors.push(msg.text());
+    });
+
+    await page.goto("/");
+    const overlay = page.locator('[data-egui-accesskit="true"]');
+    await expect(overlay).toBeAttached({ timeout: 15000 });
+
+    const pwBox = overlay.getByLabel("Password:");
+    await expect(pwBox).toHaveAttribute("type", "password");
+    const domValue = await pwBox.inputValue();
+    expect(domValue).toMatch(/^\*+$/);
+    expect(domValue.length).toBe(6);
+
+    if (browserName === "chromium") {
+      // Chromium exposes the masked value to assistive tech; each mask glyph must map to exactly one
+      // character (multi-byte bullets used to surface as three glyphs per character).
+      const cdp = await page.context().newCDPSession(page);
+      await cdp.send("Accessibility.enable");
+      const { nodes } = await cdp.send("Accessibility.getFullAXTree");
+      const pwNode = nodes.find(
+        (n) => n.role?.value === "textbox" && n.name?.value === "Password:"
+      );
+      expect(pwNode).toBeTruthy();
+      expect(pwNode.value?.value?.length).toBe(6);
+      expect(pwNode.value?.value).toMatch(/^\u2022+$/);
+    }
+
+    expect(errors).toEqual([]);
+  });
+
+  test("aria-autocomplete is mirrored only when the application sets it", async ({ page }) => {
+    await page.goto("/");
+    const overlay = page.locator('[data-egui-accesskit="true"]');
+    await expect(overlay).toBeAttached({ timeout: 15000 });
+
+    const searchBox = overlay.getByRole("textbox", { name: "Search:" });
+    await expect(searchBox).toHaveAttribute("aria-autocomplete", "list");
+    await expect(overlay.locator("[aria-autocomplete]")).toHaveCount(1);
+    expect(
+      await overlay
+        .getByRole("textbox", { name: "Note:" })
+        .evaluate((el) => el.hasAttribute("aria-autocomplete"))
+    ).toBe(false);
+  });
+
+  test("real pointer clicks reach egui through the transparent overlay", async ({ page }) => {
+    const errors = [];
+    page.on("pageerror", (err) => errors.push(err.message));
+    page.on("console", (msg) => {
+      if (msg.type() === "error") errors.push(msg.text());
+    });
+
+    await page.goto("/");
+    const overlay = page.locator('[data-egui-accesskit="true"]');
+    await expect(overlay).toBeAttached({ timeout: 15000 });
+
+    const incBtn = overlay.getByRole("button", { name: "Increment counter" });
+    const box = await incBtn.boundingBox();
+    expect(box).not.toBeNull();
+    await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    await expect(overlay.getByText("Button clicked 1 times")).toBeAttached();
+
+    const notifyCheckbox = overlay.getByRole("checkbox", { name: "Enable notifications" });
+    const checkBox = await notifyCheckbox.boundingBox();
+    expect(checkBox).not.toBeNull();
+    await page.mouse.click(checkBox.x + checkBox.width / 2, checkBox.y + checkBox.height / 2);
+    await expect(notifyCheckbox).toHaveAttribute("aria-checked", "true");
+
+    expect(errors).toEqual([]);
+  });
+
+  test("Space toggles a checkbox and opens a combobox from the keyboard", async ({ page }) => {
+    const errors = [];
+    page.on("pageerror", (err) => errors.push(err.message));
+    page.on("console", (msg) => {
+      if (msg.type() === "error") errors.push(msg.text());
+    });
+
+    await page.goto("/");
+    const overlay = page.locator('[data-egui-accesskit="true"]');
+    await expect(overlay).toBeAttached({ timeout: 15000 });
+
+    const notifyCheckbox = overlay.getByRole("checkbox", { name: "Enable notifications" });
+    await notifyCheckbox.focus();
+    await page.keyboard.press("Space");
+    await expect(notifyCheckbox).toHaveAttribute("aria-checked", "true");
+    await page.keyboard.press("Space");
+    await expect(notifyCheckbox).toHaveAttribute("aria-checked", "false");
+
+    const themeCombo = overlay.getByRole("combobox", { name: "Theme" });
+    await themeCombo.focus();
+    await page.keyboard.press("Space");
+    await expect(themeCombo).toHaveAttribute("aria-expanded", "true");
+    await expect(overlay.getByRole("option", { name: "Light" })).toBeAttached();
+
+    expect(errors).toEqual([]);
+  });
+
+  test("a dialog opened with the pointer leaves DOM focus on the canvas", async ({ page }) => {
+    const errors = [];
+    page.on("pageerror", (err) => errors.push(err.message));
+    page.on("console", (msg) => {
+      if (msg.type() === "error") errors.push(msg.text());
+    });
+
+    await page.goto("/");
+    const overlay = page.locator('[data-egui-accesskit="true"]');
+    await expect(overlay).toBeAttached({ timeout: 15000 });
+
+    const trigger = overlay.getByRole("button", { name: "Open dialog" });
+    const box = await trigger.boundingBox();
+    expect(box).not.toBeNull();
+    await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    await expect(overlay.getByRole("alertdialog", { name: "Confirmation dialog" })).toBeAttached();
+
+    const activeTag = await page.evaluate(() => document.activeElement?.tagName);
+    expect(activeTag).toBe("CANVAS");
+    expect(errors).toEqual([]);
+  });
+
+  test("keyboard dialog results are reported back to the app", async ({ page }) => {
+    const errors = [];
+    page.on("pageerror", (err) => errors.push(err.message));
+    page.on("console", (msg) => {
+      if (msg.type() === "error") errors.push(msg.text());
+    });
+
+    await page.goto("/");
+    const overlay = page.locator('[data-egui-accesskit="true"]');
+    await expect(overlay).toBeAttached({ timeout: 15000 });
+
+    const trigger = overlay.getByRole("button", { name: "Open dialog" });
+    await trigger.focus();
+    await page.keyboard.press("Enter");
+    await overlay.getByRole("button", { name: "Cancel" }).focus();
+    await page.keyboard.press("Enter");
+    await expect(overlay.getByText("Last dialog result: dismissed")).toBeAttached();
+    await expect(trigger).toBeFocused();
+
+    await trigger.focus();
+    await page.keyboard.press("Space");
+    await overlay.getByRole("button", { name: "Confirm action" }).focus();
+    await page.keyboard.press("Space");
+    await expect(overlay.getByText("Last dialog result: confirmed")).toBeAttached();
+
+    expect(errors).toEqual([]);
+  });
+
+  test("the mirror tracks canvas geometry after a viewport resize", async ({ page }) => {
+    const errors = [];
+    page.on("pageerror", (err) => errors.push(err.message));
+    page.on("console", (msg) => {
+      if (msg.type() === "error") errors.push(msg.text());
+    });
+
+    await page.goto("/");
+    const overlay = page.locator('[data-egui-accesskit="true"]');
+    await expect(overlay).toBeAttached({ timeout: 15000 });
+
+    await page.setViewportSize({ width: 820, height: 640 });
+    await expect
+      .poll(async () =>
+        page.evaluate(() => {
+          const canvas = document.getElementById("the_canvas_id").getBoundingClientRect();
+          const mirror = document
+            .querySelector('[data-egui-accesskit="true"]')
+            .getBoundingClientRect();
+          return [
+            Math.abs(canvas.left - mirror.left),
+            Math.abs(canvas.top - mirror.top),
+            Math.abs(canvas.width - mirror.width),
+            Math.abs(canvas.height - mirror.height),
+          ].every((delta) => delta < 1);
+        })
+      )
+      .toBe(true);
+
+    const incBox = await overlay.getByRole("button", { name: "Increment counter" }).boundingBox();
+    expect(incBox).not.toBeNull();
+    expect(incBox.x).toBeGreaterThanOrEqual(0);
+    expect(errors).toEqual([]);
+  });
+
+  test("WebAccessKitPlugin::teardown removes the mirror and it is not re-mounted", async ({
+    page,
+  }) => {
+    const errors = [];
+    page.on("pageerror", (err) => errors.push(err.message));
+    page.on("console", (msg) => {
+      if (msg.type() === "error") errors.push(msg.text());
+    });
+    await page.addInitScript(() => {
+      window.__mirrorMounted = false;
+      new MutationObserver(() => {
+        if (document.querySelector('[data-egui-accesskit="true"]')) window.__mirrorMounted = true;
+      }).observe(document, { childList: true, subtree: true });
+    });
+
+    await page.goto("/?teardown=1");
+    await expect.poll(() => page.evaluate(() => window.__mirrorMounted)).toBe(true);
+    await expect(page.locator('[data-egui-accesskit="true"]')).toHaveCount(0, { timeout: 15000 });
+
+    // The canvas keeps rendering, and nothing re-mounts the mirror afterwards.
+    await expect(page.locator("#the_canvas_id")).toBeVisible();
+    await settleFrames(page);
+    await page.waitForFunction(() => document.readyState === "complete");
+    await expect(page.locator('[data-egui-accesskit="true"]')).toHaveCount(0);
+    expect(errors).toEqual([]);
+  });
+
+  test("supports Shadow DOM via WebAccessKitPlugin::from_canvas", async ({ page }) => {
+    const errors = [];
+    page.on("pageerror", (err) => errors.push(err.message));
+    page.on("console", (msg) => {
+      if (msg.type() === "error") errors.push(msg.text());
+    });
 
     await page.goto("/?shadow=1");
 
@@ -383,9 +695,7 @@ test.describe("egui-web-accesskit E2E", () => {
     await shadowOverlay
       .getByRole("button", { name: "Increment counter" })
       .evaluate((el) => el.click());
-    await expect(
-      shadowOverlay.getByText("Button clicked 1 times")
-    ).toBeAttached();
+    await expect(shadowOverlay.getByText("Button clicked 1 times")).toBeAttached();
 
     const noteBox = shadowOverlay.getByRole("textbox", { name: "Note:" });
     await noteBox.evaluate((el) => {
@@ -403,20 +713,51 @@ test.describe("egui-web-accesskit E2E", () => {
     expect(errors).toEqual([]);
   });
 
-  test("supports lazy activation via WebAccessKitPlugin::new_lazy", async ({
+  test("keyboard focus on the lazy activation button moves into the mirror instead of document.body", async ({
     page,
   }) => {
     const errors = [];
     page.on("pageerror", (err) => errors.push(err.message));
+    page.on("console", (msg) => {
+      if (msg.type() === "error") errors.push(msg.text());
+    });
+
+    await page.goto("/?lazy=1");
+    const overlay = page.locator('[data-egui-accesskit="true"]');
+    const activateBtn = overlay.locator("[data-egui-accesskit-activate]");
+    await expect(activateBtn).toBeAttached({ timeout: 15000 });
+
+    // Focusing the activation button activates the mirror and removes that button.
+    await activateBtn.focus();
+    await expect(activateBtn).toHaveCount(0);
+    await expect(overlay.getByRole("button", { name: "Increment counter" })).toBeAttached({
+      timeout: 15000,
+    });
+
+    await expect
+      .poll(() =>
+        page.evaluate(() => {
+          const overlayEl = document.querySelector('[data-egui-accesskit="true"]');
+          return overlayEl !== null && overlayEl.contains(document.activeElement);
+        })
+      )
+      .toBe(true);
+    expect(errors).toEqual([]);
+  });
+
+  test("supports lazy activation via WebAccessKitPlugin::new_lazy", async ({ page }) => {
+    const errors = [];
+    page.on("pageerror", (err) => errors.push(err.message));
+    page.on("console", (msg) => {
+      if (msg.type() === "error") errors.push(msg.text());
+    });
 
     await page.goto("/?lazy=1");
 
     const overlay = page.locator('[data-egui-accesskit="true"]');
     const activateBtn = overlay.locator("[data-egui-accesskit-activate]");
     await expect(activateBtn).toBeAttached({ timeout: 15000 });
-    await expect(
-      overlay.getByRole("button", { name: "Increment counter" })
-    ).toHaveCount(0);
+    await expect(overlay.getByRole("button", { name: "Increment counter" })).toHaveCount(0);
 
     await activateBtn.evaluate((el) => el.click());
     await expect(activateBtn).toHaveCount(0);

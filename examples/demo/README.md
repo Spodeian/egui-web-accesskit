@@ -1,6 +1,6 @@
 # egui-web-accesskit Demo App
 
-Standalone two-column `eframe` showcase exercising the widgets, ARIA metadata, focus/scroll sync, popups (`ComboBox`), modal `AlertDialog`, polite `aria-live` status announcements, password masking, and Shadow DOM support mirrored by `egui-web-accesskit` (available and verified across all three version branches: `main` / `0.37`, `egui-0.36` / `0.36`, and `egui-0.35` / `0.35`).
+Standalone two-column `eframe` showcase exercising the widgets, ARIA metadata, focus/scroll sync, popups (`ComboBox`), modal `AlertDialog` (keyboard-openable via Enter/Space, with focus trapping and restoration), polite `aria-live` status announcements, password masking, and Shadow DOM support mirrored by `egui-web-accesskit` (available and verified across all three version branches: `main` / `0.37`, `egui-0.36` / `0.36`, and `egui-0.35` / `0.35`).
 
 ## Prerequisites
 
@@ -22,10 +22,9 @@ cargo install trunk
   trunk build
   ```
 
-- **Natively on desktop (plugin becomes a no-op, using `eframe`'s native AccessKit integration):**
-  ```sh
-  cargo run
-  ```
+- **Teardown mode (`?teardown=1`):** unmounts the mirror with `WebAccessKitPlugin::teardown` a few frames after startup, used by the E2E suite.
+
+> The demo is browser-only. Its egui and bridge dependencies are restricted to `wasm32`, so `cargo run` on a desktop target only prints an explanation and exits. The bridge itself is a no-op on native targets, so there is nothing to see there.
 
 ## Inspecting the Mirrored Accessibility Tree
 
