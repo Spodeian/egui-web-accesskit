@@ -177,14 +177,14 @@ impl egui::Plugin for WebAccessKitPlugin {
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
+    fn input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
         if dom::has_dom_focus(self.bridge_id) {
             input.focused = true;
             input
                 .events
                 .retain(|event| !matches!(event, egui::Event::WindowFocused(false)));
         }
-        dom::drain_pending_events(self.bridge_id, &self.queue, &mut input.events);
+        dom::drain_pending_events(self.bridge_id, ctx, &self.queue, &mut input.events);
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -194,7 +194,7 @@ impl egui::Plugin for WebAccessKitPlugin {
         {
             return;
         }
-        let Some(update) = output.platform_output.accesskit_update.clone() else {
+        let Some(update) = output.platform_output.accesskit_update.take() else {
             return;
         };
         dom::with_bridge_mut(self.bridge_id, |bridge| {

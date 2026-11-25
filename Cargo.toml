@@ -1,6 +1,6 @@
 [package]
 name = "egui-web-accesskit"
-version = "0.36.2"
+version = "0.36.3"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
@@ -34,8 +34,13 @@ web-sys = { version = "0.3", features = [
     "HtmlElement",
     "HtmlInputElement",
     "HtmlTextAreaElement",
+    "InputEvent",
     "KeyboardEvent",
     "Node",
+    "ResizeObserver",
     "ShadowRoot",
     "Window",
 ] }
+
+[dev-dependencies]
+egui = { version = "0.36", default-features = false, features = ["default_fonts"] }
