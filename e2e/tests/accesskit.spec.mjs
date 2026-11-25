@@ -119,11 +119,13 @@ test.describe("egui-web-accesskit E2E", () => {
     await themeCombo.evaluate((el) => el.click());
     await expect(lightBtn).toHaveCount(0);
 
-    // 2c. Modal AlertDialog + axe-core check while open + close
+    // 2c. Modal AlertDialog + background inert trapping + axe-core check while open + close
     await overlay.getByRole("button", { name: "Open dialog" }).evaluate((el) => el.click());
     const modal = overlay.getByRole("alertdialog", { name: "Confirmation dialog" });
     await expect(modal).toBeAttached();
     await expect(modal).toHaveAttribute("aria-modal", "true");
+    expect(await incBtn.evaluate((el) => el.closest("[inert]") !== null)).toBe(true);
+    expect(await modal.evaluate((el) => el.closest("[inert]") !== null)).toBe(false);
 
     const modalAxe = await new AxeBuilder({ page })
       .include('[data-egui-accesskit="true"]')
@@ -133,6 +135,7 @@ test.describe("egui-web-accesskit E2E", () => {
 
     await overlay.getByRole("button", { name: "Close dialog" }).evaluate((el) => el.click());
     await expect(modal).toHaveCount(0);
+    expect(await incBtn.evaluate((el) => el.closest("[inert]") !== null)).toBe(false);
 
     // 3. Disclosure click reveals hidden content
     await detailsBtn.evaluate((el) => el.click());
@@ -145,15 +148,14 @@ test.describe("egui-web-accesskit E2E", () => {
       .poll(async () => Number(await opacitySlider.inputValue()))
       .toBeGreaterThan(0.35);
 
-    // 5. beforeinput guard prevents DOM drift; sibling insertion above focused textbox keeps DOM focus
-    await noteBox.focus();
-    await page.keyboard.type("x");
-    await expect(noteBox).toHaveValue("Type here");
-
-    await overlay.getByRole("button", { name: "Toggle warning" }).evaluate((el) =>
-      el.click()
-    );
+    // 5. Sibling insertion above focused textbox keeps DOM focus, and clear resets value
+    await noteBox.evaluate((el) => {
+      el.focus();
+      el.setSelectionRange(0, el.value.length);
+    });
+    await page.keyboard.type("!hello");
     await expect(overlay.getByText("Warning banner")).toBeAttached();
+    await expect(noteBox).toHaveValue("!hello");
     const stillFocused = await noteBox.evaluate(
       (el) => el === document.activeElement
     );
@@ -164,7 +166,38 @@ test.describe("egui-web-accesskit E2E", () => {
     );
     await expect(noteBox).toHaveValue("");
 
-    // 6. Multiline <textarea>, placeholder, selection sync, Token, and Password masking
+    // 5b. IME composition defers sync until compositionend commits
+    await noteBox.evaluate((el) => {
+      el.focus();
+      el.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+      el.value = "ka";
+      el.dispatchEvent(
+        new InputEvent("input", {
+          bubbles: true,
+          inputType: "insertCompositionText",
+          data: "ka",
+          isComposing: true,
+        })
+      );
+    });
+    const toggleWarningBtn = overlay.getByRole("button", { name: "Toggle warning" });
+    await toggleWarningBtn.evaluate((el) => el.click());
+    await expect(overlay.getByText("Warning banner")).toBeAttached();
+    await expect(noteBox).toHaveValue("ka");
+    await noteBox.evaluate((el) => {
+      el.value = "漢";
+      el.dispatchEvent(
+        new CompositionEvent("compositionend", { bubbles: true, data: "漢" })
+      );
+    });
+    await expect(noteBox).toHaveValue("漢");
+    await toggleWarningBtn.evaluate((el) => el.click());
+    await overlay.getByRole("button", { name: "Clear note" }).evaluate((el) =>
+      el.click()
+    );
+    await expect(noteBox).toHaveValue("");
+
+    // 6. Multiline <textarea>, placeholder, selection sync, read-only input, and ScrollIntoView
     const bioBox = overlay.getByLabel("Bio:");
     await expect(bioBox).toHaveJSProperty("tagName", "TEXTAREA");
     await expect(bioBox).toHaveAttribute("placeholder", "Write bio");
@@ -172,7 +205,11 @@ test.describe("egui-web-accesskit E2E", () => {
     await expect(bioBox).toHaveValue("Line 1");
 
     await bioBox.focus();
-    await page.waitForTimeout(100);
+    await page.keyboard.press("End");
+    await page.keyboard.press("Enter");
+    await page.keyboard.type("Line 2");
+    await expect(bioBox).toHaveValue("Line 1\nLine 2");
+
     await bioBox.evaluate((el) => {
       el.setSelectionRange(0, 6);
       el.dispatchEvent(new Event("select"));
@@ -186,8 +223,11 @@ test.describe("egui-web-accesskit E2E", () => {
 
     const tokenBox = overlay.getByLabel("Token:");
     await expect(tokenBox).toHaveValue("RO-123");
+    await tokenBox.focus();
+    await page.keyboard.type("Z");
+    await expect(tokenBox).toHaveValue("RO-123");
 
-    // 7. Password masking safety (no plaintext exposed in DOM)
+    // 7. Password masking safety & ReplaceSelectedText / SetValue editing
     const pwBox = overlay.getByLabel("Password:");
     await expect(pwBox).toHaveAttribute("type", "password");
     await expect(overlay.getByText("Secret length: 6")).toBeAttached();
@@ -196,6 +236,18 @@ test.describe("egui-web-accesskit E2E", () => {
     const pwInitialValue = await pwBox.inputValue();
     expect(pwInitialValue).not.toContain("s3cr3t");
     expect(pwInitialValue.length).toBe(6);
+
+    await pwBox.focus();
+    await page.keyboard.press("End");
+    await page.keyboard.type("!");
+    await expect(overlay.getByText("Secret length: 7")).toBeAttached();
+
+    await pwBox.evaluate((el) => {
+      el.focus();
+      el.setSelectionRange(0, el.value.length);
+    });
+    await page.keyboard.type("newpass12");
+    await expect(overlay.getByText("Secret length: 9")).toBeAttached();
 
     // 8. ScrollArea ScrollIntoView on DOM focus + PageDown/PageUp scroll actions
     const topItemBtn = overlay.getByRole("button", { name: "Top item" });
@@ -278,6 +330,10 @@ test.describe("egui-web-accesskit E2E", () => {
       boxAfter.y + boxAfter.height / 2
     );
     await expect(overlay.getByText("Button clicked 2 times")).toBeAttached();
+    const activeInsideOverlay = await overlay.evaluate((el) =>
+      el.contains(document.activeElement)
+    );
+    expect(activeInsideOverlay).toBe(false);
 
     expect(errors).toEqual([]);
   });
@@ -316,10 +372,11 @@ test.describe("egui-web-accesskit E2E", () => {
     ).toBeAttached();
 
     const noteBox = shadowOverlay.getByRole("textbox", { name: "Note:" });
-    await noteBox.focus();
-    await shadowOverlay
-      .getByRole("button", { name: "Toggle warning" })
-      .evaluate((el) => el.click());
+    await noteBox.evaluate((el) => {
+      el.focus();
+      el.setSelectionRange(0, el.value.length);
+    });
+    await page.keyboard.type("!shadow");
     await expect(shadowOverlay.getByText("Warning banner")).toBeAttached();
     const activeInShadow = await noteBox.evaluate((el) => {
       const host = document.getElementById("shadow-host");

@@ -8,9 +8,9 @@ This repository mirrors `egui`'s minor version so there are no feature flags to 
 
 | `egui` / `eframe` | `egui-web-accesskit` | Branch / Tag |
 | --- | --- | --- |
-| `0.37` | `0.37` | `main` / `v0.37.2` |
-| `0.36` | `0.36` | `egui-0.36` / `v0.36.2` |
-| `0.35` | `0.35` | `egui-0.35` / `v0.35.2` |
+| `0.37` | `0.37` | `main` / `v0.37.3` |
+| `0.36` | `0.36` | `egui-0.36` / `v0.36.3` |
+| `0.35` | `0.35` | `egui-0.35` / `v0.35.3` |
 
 ## Quick Start
 
@@ -39,10 +39,10 @@ On non-`wasm32` targets the plugin is a clean no-op so native builds can keep us
 
 ## How It Works
 
-1. `Plugin::setup` enables AccessKit on the `egui::Context` (`ctx.enable_accesskit()`), mounts a visually transparent `<div data-egui-accesskit="true" role="application">` aligned over the target `<canvas>`, and registers passive `window` `"scroll"` / `"resize"` listeners so `position: fixed` elements stay aligned even while `egui` is idle.
-2. `Plugin::output_hook` skips intermediate discarded layout passes, clones `output.platform_output.accesskit_update`, applies incremental changes with `accesskit_consumer::Tree`, hoists popup subtrees attached to leaf elements (`<button>`, `<input>`, `<textarea>`, `<a>`) with `aria-controls` / `aria-expanded`, and patches mirrored HTML/ARIA elements — including `<textarea>` (`aria-multiline`), native heading elements (`<h1>`–`<h6>`) + `aria-level`, `aria-modal`, `aria-live`, `aria-description`, `aria-valuetext`, `placeholder`, `readonly`/`aria-readonly`, role-accurate `aria-pressed` / `aria-selected` / `aria-checked`, safe link `href`s, UTF-16 text selection sync, and `window.devicePixelRatio`-scaled bounds.
-3. `Plugin::input_hook` keeps `RawInput::focused` true while a mirrored DOM element has focus and drains DOM events (`click`, `Enter`/`Space` activation on custom roles such as `option`, `focus` + `ScrollIntoView`, `input`, masked password `ReplaceSelectedText` edits, `select`/navigation `keyup` selection updates, `PageUp`/`PageDown` scroll actions, and arrow keys on unstepped sliders) into `RawInput::events` as `egui::Event::AccessKitActionRequest`. On `egui 0.35`/`0.36` where `TextEdit` does not handle programmatic text mutations, DOM `beforeinput` events on mirrored text fields are canceled to prevent overlay value drift.
-4. `Plugin::on_exit` / `WebAccessKitPlugin::teardown` tears down DOM event listeners (including capture-phase `window` listeners) and removes the overlay container.
+1. `Plugin::setup` enables AccessKit on the `egui::Context` (`ctx.enable_accesskit()`), mounts a visually transparent `<div data-egui-accesskit="true" role="application">` aligned over the target `<canvas>`'s CSS content box (`contain: strict`, `overflow: hidden`), and registers passive `window` `"scroll"` / `"resize"` listeners plus a canvas `ResizeObserver` so overlay layout tracks host page changes while `egui` is idle.
+2. `Plugin::output_hook` skips intermediate discarded layout passes, takes ownership of `output.platform_output.accesskit_update`, diffs changes incrementally via `accesskit_consumer::Tree`, hoists popups attached to leaf elements (`<button>`, `<input>`, `<textarea>`, `<a>`) with `aria-controls` / `aria-expanded`, traps background subtrees with `inert` while a modal dialog is active, and patches only changed DOM attributes/bounds (`position: absolute` relative to the overlay box so outer page scrolling is O(1)).
+3. `Plugin::input_hook` keeps `RawInput::focused` true while a mirrored DOM element has focus and drains DOM events (`click`, `Enter`/`Space` activation on custom roles such as `option`, `focus` + `ScrollIntoView`, `input` / `compositionend`, masked password range edits, `select` / navigation `keyup` selection updates, `PageUp`/`PageDown` scroll actions, and arrow keys on unstepped sliders) into `RawInput::events`. On `egui 0.35`/`0.36` where `TextEdit` does not handle `Action::SetValue` / `Action::ReplaceSelectedText`, DOM text edits fall back cleanly to focus-synchronized `Key::A` + `Backspace` + `Event::Paste` / `SetTextSelection` events, and overlay focus sync never steals DOM focus away from `<canvas>` or `eframe`'s `TextAgent`.
+4. `Plugin::on_exit` / `WebAccessKitPlugin::teardown` disconnects the `ResizeObserver`, tears down DOM event listeners (including capture-phase `window` listeners), clears modal `inert` attributes, and removes the overlay container.
 
 ## Customizing AccessKit Semantics in `egui`
 
@@ -76,10 +76,11 @@ ui.ctx().accesskit_node_builder(docs.id, |node| {
 
 ## Layout, Shadow DOM, & Input Routing Notes
 
-- **Canvas sizing, outer scroll, and zoom:** Overlay elements are positioned with `position: fixed` using `canvas.get_bounding_client_rect()` and `window.devicePixelRatio`, so normal scrolling pages, CSS flex/grid layouts, and `ctx.set_zoom_factor(...)` remain aligned even when `egui` is idle.
+- **Canvas sizing, outer scroll, and zoom:** Mirrored children use `position: absolute` inside an `overflow: hidden; contain: strict` overlay synced to the canvas content box (via `getBoundingClientRect()`, `clientLeft`/`clientTop`/`clientWidth`/`clientHeight`, backing buffer ratio, `window` scroll/resize, and `ResizeObserver`), so outer page scrolling is O(1) (container `left`/`top` only), host CSS layout shifts stay aligned while `egui` is idle, and `ctx.set_zoom_factor(...)` scales accurately.
 - **Shadow DOM:** `WebAccessKitPlugin::from_canvas(canvas)` attaches the overlay inside the canvas's parent `ShadowRoot` and resolves focus against `shadowRoot.activeElement`.
-- **Password fields:** Plaintext is never written into `DomNodeSpec` or DOM attributes; user edits inside a masked `<input type="password">` are translated via diffed UTF-16 `SetTextSelection` + `ReplaceSelectedText` (or `SetValue` when replacing all text) without leaking plaintext.
-- **Pointer events (`pointer-events: none`):** Mirrored DOM elements have `pointer-events: none` so mouse clicks, drags, hovers, and wheel events pass straight through to the underlying `<canvas>`. The tradeoff is that touch-explore accessibility modes on mobile screen readers (which hit-test DOM nodes by touch coordinates) cannot focus elements directly without screen-reader swipe navigation.
+- **Password fields:** Plaintext is never written into `DomNodeSpec` or DOM attributes; user edits inside a masked `<input type="password">` are translated via diffed UTF-16 `SetTextSelection` + `ReplaceSelectedText` (or fallback paste on `0.35`/`0.36`, and `SetValue` / select-all paste when replacing all text) without leaking plaintext.
+- **IME & focus coordination:** Clicking or typing directly on `<canvas>` leaves focus on `<canvas>` / `eframe::TextAgent`; when editing inside a mirrored DOM `<input>` / `<textarea>`, `InputEvent.isComposing` pauses `egui` value sync until `compositionend` commits.
+- **Pointer events (`pointer-events: none`):** Mirrored DOM elements have `pointer-events: none` so mouse clicks, drags, hovers, and wheel events pass straight through to the underlying `<canvas>` with zero extra hit-test latency. Chromium AT (`kIgnorePointerEventsNone`) still resolves screen-reader touch exploration from DOM bounds; platforms that strictly hit-test by pointer coordinates (such as iOS VoiceOver touch-explore) use swipe/focus navigation instead.
 
 ## Running Tests & Demo
 
@@ -96,6 +97,5 @@ See [examples/demo/README.md](examples/demo/README.md) to run the interactive `e
 
 ## Known Limitations
 
-- **`egui 0.35` / `0.36` upstream coverage:** On `egui 0.35` and `0.36`, `egui` itself does not yet handle `Action::SetValue` / `Action::ReplaceSelectedText` on `TextEdit`, emit `is_expanded` on `CollapsingHeader`, or emit `read_only` on `&str` `TextEdit`; text reading, focus, scroll actions, buttons, checkboxes, and sliders work on `0.35`/`0.36`, while remote DOM text editing, `readonly` from `&str`, and `aria-expanded` require `egui 0.37`.
-- **IME composition:** `eframe`'s internal `TextAgent` IME flow is independent of the mirrored DOM text inputs.
-- **Role coverage:** Core interactive controls (`Button` including toggle `aria-pressed`, `DisclosureTriangle`, `Tab`/`TabList`, `MenuItem`/`MenuItemCheckBox`/`MenuItemRadio`, `CheckBox` including mixed tri-state, `Switch`, `RadioButton`/`RadioGroup`, `ComboBox`/`EditableComboBox` with `ListBox`/`option`, `Slider` stepped and unstepped, `SpinButton` / `DragValue`, `ProgressIndicator`, single-line, multiline, and password `TextEdit`, `Label`, `Link`, `Window`, `Dialog`/`AlertDialog` with `aria-modal`, `Alert`/`Status` with `aria-live`, headings with `aria-level`, lists, and regions) are mapped to semantic HTML/ARIA elements; complex grids/tables remain simplified.
+- **`egui 0.35` / `0.36` upstream metadata:** On `egui 0.35` and `0.36`, `egui` itself does not emit `is_expanded` on `CollapsingHeader`, `read_only` on `&str` `TextEdit`, or `ListBox` roles on `ComboBox` popups (`TextEdit` DOM editing, focus, scroll actions, buttons, checkboxes, and sliders all work across `0.35`–`0.37`).
+- **Role coverage:** Core interactive controls (`Button` including toggle `aria-pressed`, `DisclosureTriangle`, `Tab`/`TabList`/`TabPanel`, `Menu`/`MenuBar`/`MenuItem*`, `CheckBox` including mixed tri-state, `Switch`, `RadioButton`/`RadioGroup`, `ComboBox`/`EditableComboBox` with `ListBox`/`option`, `Table`/`Grid`/`TreeGrid` with `Row`/`Cell`/`GridCell`/`Header`, `Tree`/`TreeItem`, `Slider` stepped and unstepped, `SpinButton`/`DragValue`, `ProgressIndicator`, single-line, multiline, and password `TextEdit`, `Label`, `Image`, `Link`, landmarks, `Window`, `Dialog`/`AlertDialog` with `aria-modal` + `inert`, `Alert`/`Status` with `aria-live`, headings with `aria-level`, and lists) are mapped to semantic HTML/ARIA elements with context guards.

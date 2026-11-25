@@ -3,11 +3,14 @@
 //! Most applications only need [`crate::WebAccessKitPlugin`]; this module is exposed for
 //! headless testing and custom DOM hosts.
 
+use std::collections::HashMap;
+
 use accesskit_consumer::{FilterResult, Node, Tree, TreeChangeHandler};
 use egui::accesskit::{
     Action, ActionData, ActionRequest, Live, NodeId, Rect, Role, TextSelection, Toggled, TreeId,
     TreeUpdate,
 };
+use egui::{Event, Key, Modifiers};
 
 /// Semantic HTML element tag chosen for an AccessKit node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,13 +129,14 @@ pub enum DomOp {
 
 /// Maps an AccessKit consumer node into a [`DomNodeSpec`].
 pub fn map_node(node: &Node<'_>) -> DomNodeSpec {
+    let label = node.label().filter(|s| !s.is_empty());
     let (mut tag, mut aria_role, mut input_type) = map_role(node.role());
     match node.role() {
         Role::Label if node.url().is_some_and(|u| !u.is_empty()) => {
             tag = DomTag::Anchor;
             aria_role = None;
         }
-        Role::Button if node.toggled().is_some() && has_ancestor_role(node, Role::ListBox) => {
+        Role::Button if node.toggled().is_some() && has_any_ancestor(node, &[Role::ListBox]) => {
             tag = DomTag::Div;
             aria_role = Some("option");
             input_type = None;
@@ -145,21 +149,21 @@ pub fn map_node(node: &Node<'_>) -> DomNodeSpec {
         {
             aria_role = Some("group");
         }
-        Role::ListBoxOption if !has_ancestor_role(node, Role::ListBox) => {
+        Role::ListBoxOption if !has_any_ancestor(node, &[Role::ListBox]) => {
             tag = DomTag::Button;
             aria_role = None;
         }
-        Role::Tab if !has_ancestor_role(node, Role::TabList) => {
+        Role::Tab if !has_any_ancestor(node, &[Role::TabList]) => {
             aria_role = None;
         }
         Role::TabList if !has_descendant(node, &|c| c.role() == Role::Tab) => {
             aria_role = Some("group");
         }
-        Role::MenuItem | Role::MenuItemCheckBox | Role::MenuItemRadio
-            if !(has_ancestor_role(node, Role::Menu) || has_ancestor_role(node, Role::MenuBar)) =>
+        Role::MenuItem | Role::MenuItemCheckBox | Role::MenuItemRadio | Role::MenuListOption
+            if !has_any_ancestor(node, &[Role::Menu, Role::MenuBar, Role::MenuListPopup]) =>
         {
             match node.role() {
-                Role::MenuItem => {
+                Role::MenuItem | Role::MenuListOption => {
                     tag = DomTag::Button;
                     aria_role = None;
                 }
@@ -176,10 +180,67 @@ pub fn map_node(node: &Node<'_>) -> DomNodeSpec {
                 _ => {}
             }
         }
+        Role::Menu | Role::MenuBar | Role::MenuListPopup
+            if !has_descendant(node, &|c| {
+                matches!(
+                    c.role(),
+                    Role::MenuItem
+                        | Role::MenuItemCheckBox
+                        | Role::MenuItemRadio
+                        | Role::MenuListOption
+                )
+            }) =>
+        {
+            aria_role = Some("group");
+        }
+        Role::Table | Role::Grid | Role::TreeGrid
+            if !has_descendant(node, &|c| matches!(c.role(), Role::Row | Role::RowGroup)) =>
+        {
+            aria_role = Some("group");
+        }
+        Role::RowGroup
+            if !(has_any_ancestor(node, &[Role::Table, Role::Grid, Role::TreeGrid])
+                && has_descendant(node, &|c| c.role() == Role::Row)) =>
+        {
+            aria_role = Some("group");
+        }
+        Role::Row
+            if !(has_any_ancestor(
+                node,
+                &[Role::Table, Role::Grid, Role::TreeGrid, Role::RowGroup],
+            ) && has_descendant(node, &|c| {
+                matches!(
+                    c.role(),
+                    Role::Cell | Role::GridCell | Role::ColumnHeader | Role::RowHeader
+                )
+            })) =>
+        {
+            aria_role = Some("group");
+        }
+        Role::Cell | Role::GridCell => {
+            if !has_any_ancestor(node, &[Role::Row]) {
+                aria_role = None;
+            } else if has_any_ancestor(node, &[Role::Grid, Role::TreeGrid]) {
+                aria_role = Some("gridcell");
+            } else {
+                aria_role = Some("cell");
+            }
+        }
+        Role::ColumnHeader | Role::RowHeader if !has_any_ancestor(node, &[Role::Row]) => {
+            aria_role = None;
+        }
+        Role::Tree if !has_descendant(node, &|c| c.role() == Role::TreeItem) => {
+            aria_role = Some("group");
+        }
+        Role::TreeItem if !has_any_ancestor(node, &[Role::Tree]) => {
+            aria_role = None;
+        }
+        Role::Image if label.is_none() => {
+            aria_role = None;
+        }
         _ => {}
     }
 
-    let label = node.label().filter(|s| !s.is_empty());
     let description = node.description().filter(|s| !s.is_empty());
     // `value()` skips text-range extraction on multiline text inputs, so
     // fall back to the raw value string when present.
@@ -236,10 +297,10 @@ pub fn map_node(node: &Node<'_>) -> DomNodeSpec {
     }
 }
 
-fn has_ancestor_role(node: &Node<'_>, target: Role) -> bool {
+fn has_any_ancestor(node: &Node<'_>, targets: &[Role]) -> bool {
     let mut current = node.parent();
     while let Some(parent) = current {
-        if parent.role() == target {
+        if targets.contains(&parent.role()) {
             return true;
         }
         current = parent.parent();
@@ -268,7 +329,11 @@ fn map_role(role: Role) -> (DomTag, Option<&'static str>, Option<&'static str>) 
         }
         Role::Tab => (DomTag::Button, Some("tab"), None),
         Role::TabList => (DomTag::Div, Some("tablist"), None),
-        Role::MenuItem => (DomTag::Button, Some("menuitem"), None),
+        Role::TabPanel => (DomTag::Div, Some("tabpanel"), None),
+        Role::Menu => (DomTag::Div, Some("menu"), None),
+        Role::MenuBar => (DomTag::Div, Some("menubar"), None),
+        Role::MenuListPopup => (DomTag::Div, Some("menu"), None),
+        Role::MenuItem | Role::MenuListOption => (DomTag::Button, Some("menuitem"), None),
         Role::MenuItemCheckBox => (DomTag::Button, Some("menuitemcheckbox"), None),
         Role::MenuItemRadio => (DomTag::Button, Some("menuitemradio"), None),
         Role::CheckBox => (DomTag::Input, Some("checkbox"), Some("checkbox")),
@@ -286,10 +351,30 @@ fn map_role(role: Role) -> (DomTag, Option<&'static str>, Option<&'static str>) 
         Role::Label | Role::TextRun => (DomTag::Span, None, None),
         Role::Link => (DomTag::Anchor, None, None),
         Role::Heading => (DomTag::Heading, Some("heading"), None),
+        Role::Image => (DomTag::Div, Some("img"), None),
         Role::List => (DomTag::List, None, None),
         Role::ListBox => (DomTag::Div, Some("listbox"), None),
         Role::ListItem => (DomTag::ListItem, None, None),
         Role::ListBoxOption => (DomTag::Div, Some("option"), None),
+        Role::Table => (DomTag::Div, Some("table"), None),
+        Role::Grid => (DomTag::Div, Some("grid"), None),
+        Role::TreeGrid => (DomTag::Div, Some("treegrid"), None),
+        Role::RowGroup => (DomTag::Div, Some("rowgroup"), None),
+        Role::Row => (DomTag::Div, Some("row"), None),
+        Role::Cell => (DomTag::Div, Some("cell"), None),
+        Role::GridCell => (DomTag::Div, Some("gridcell"), None),
+        Role::ColumnHeader => (DomTag::Div, Some("columnheader"), None),
+        Role::RowHeader => (DomTag::Div, Some("rowheader"), None),
+        Role::Tree => (DomTag::Div, Some("tree"), None),
+        Role::TreeItem => (DomTag::Div, Some("treeitem"), None),
+        Role::Toolbar => (DomTag::Div, Some("toolbar"), None),
+        Role::Navigation => (DomTag::Div, Some("navigation"), None),
+        Role::Main => (DomTag::Div, Some("main"), None),
+        Role::Search => (DomTag::Div, Some("search"), None),
+        Role::Form => (DomTag::Div, Some("form"), None),
+        Role::Tooltip => (DomTag::Div, Some("tooltip"), None),
+        Role::ScrollBar => (DomTag::Div, Some("scrollbar"), None),
+        Role::Splitter => (DomTag::Div, Some("separator"), None),
         Role::Window | Role::Region | Role::ScrollView | Role::Pane => (DomTag::Region, None, None),
         Role::Dialog => (DomTag::Div, Some("dialog"), None),
         Role::AlertDialog => (DomTag::Div, Some("alertdialog"), None),
@@ -319,16 +404,35 @@ fn collect_dom_children(node: &Node<'_>) -> Vec<NodeId> {
         .collect()
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum BridgeOp {
+    Upsert {
+        old: Option<DomNodeSpec>,
+        spec: DomNodeSpec,
+    },
+    SetChildren {
+        parent: NodeId,
+        children: Vec<NodeId>,
+    },
+    Remove(NodeId),
+    SetFocus(Option<NodeId>),
+}
+
 /// Retains an `accesskit_consumer::Tree` across frames and translates updates into [`DomOp`]s.
 #[derive(Default)]
 pub struct TreeBridge {
     tree: Option<Tree>,
+    specs: HashMap<NodeId, DomNodeSpec>,
 }
 
 impl TreeBridge {
     /// Creates an empty [`TreeBridge`] awaiting the first AccessKit [`TreeUpdate`].
     pub fn new() -> Self {
-        Self { tree: None }
+        Self {
+            tree: None,
+            specs: HashMap::new(),
+        }
     }
 
     /// Root node ID of the retained tree, if initialized.
@@ -336,15 +440,40 @@ impl TreeBridge {
         self.tree.as_ref().map(|tree| tree.state().root().locate().0)
     }
 
+    /// Currently focused node ID in the retained tree, if initialized.
+    pub fn focused_id(&self) -> Option<NodeId> {
+        self.tree
+            .as_ref()
+            .and_then(|tree| tree.state().focus().filter(|n| !should_skip_node(n)))
+            .map(|n| n.locate().0)
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub(crate) fn spec(&self, id: NodeId) -> Option<&DomNodeSpec> {
+        self.specs.get(&id)
+    }
+
     /// Applies an AccessKit [`TreeUpdate`] and returns ordered DOM mutations.
     pub fn apply_update(&mut self, update: TreeUpdate) -> Vec<DomOp> {
+        self.apply_update_diff(update)
+            .into_iter()
+            .map(|op| match op {
+                BridgeOp::Upsert { spec, .. } => DomOp::Upsert(spec),
+                BridgeOp::SetChildren { parent, children } => DomOp::SetChildren { parent, children },
+                BridgeOp::Remove(id) => DomOp::Remove(id),
+                BridgeOp::SetFocus(target) => DomOp::SetFocus(target),
+            })
+            .collect()
+    }
+
+    pub(crate) fn apply_update_diff(&mut self, update: TreeUpdate) -> Vec<BridgeOp> {
         if let Some(tree) = self.tree.as_mut() {
-            let mut collector = DeltaCollector::default();
+            let mut collector = DeltaCollector::new(&mut self.specs);
             tree.update_and_process_changes(update, &mut collector);
             collector.into_ops()
         } else {
             let tree = Tree::new(update, true);
-            let ops = collect_initial_ops(&tree);
+            let ops = collect_initial_ops(&tree, &mut self.specs);
             self.tree = Some(tree);
             ops
         }
@@ -360,6 +489,60 @@ impl TreeBridge {
                 n.data().supports_action(Action::SetValue)
                     || n.data().supports_action(Action::ReplaceSelectedText)
             })
+    }
+
+    /// Translates a whole-field replacement into keyboard + paste events for `egui` versions
+    /// that do not handle `Action::SetValue` on `TextEdit`.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub(crate) fn fallback_set_value_events(value: String) -> Vec<Event> {
+        let mut events = vec![
+            Event::Key {
+                key: Key::A,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::COMMAND,
+            },
+            Event::Key {
+                key: Key::Backspace,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            },
+        ];
+        if !value.is_empty() {
+            events.push(Event::Paste(value));
+        }
+        events
+    }
+
+    /// Translates a UTF-16 range replacement into selection + paste/backspace events for `egui`
+    /// versions that do not handle `Action::ReplaceSelectedText` on `TextEdit`.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub(crate) fn fallback_replace_range_events(
+        &self,
+        target_node: NodeId,
+        anchor_utf16: usize,
+        focus_utf16: usize,
+        text: String,
+    ) -> Vec<Event> {
+        let mut events = Vec::new();
+        if let Some(req) = self.set_text_selection_action(target_node, anchor_utf16, focus_utf16) {
+            events.push(Event::AccessKitActionRequest(req));
+        }
+        if !text.is_empty() {
+            events.push(Event::Paste(text));
+        } else if anchor_utf16 != focus_utf16 {
+            events.push(Event::Key {
+                key: Key::Backspace,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            });
+        }
+        events
     }
 
     /// Resolves UTF-16 selection offsets for `target_node` into an AccessKit `SetTextSelection` request.
@@ -392,8 +575,9 @@ impl TreeBridge {
     }
 }
 
-fn collect_initial_ops(tree: &Tree) -> Vec<DomOp> {
+fn collect_initial_ops(tree: &Tree, specs: &mut HashMap<NodeId, DomNodeSpec>) -> Vec<BridgeOp> {
     let state = tree.state();
+    specs.clear();
     let mut upserts = Vec::new();
     let mut children_ops = Vec::new();
     let mut stack = vec![state.root()];
@@ -402,10 +586,12 @@ fn collect_initial_ops(tree: &Tree) -> Vec<DomOp> {
         if should_skip_node(&node) {
             continue;
         }
-        upserts.push(DomOp::Upsert(map_node(&node)));
+        let spec = map_node(&node);
+        specs.insert(spec.id, spec.clone());
+        upserts.push(BridgeOp::Upsert { old: None, spec });
         let child_ids = collect_dom_children(&node);
         if !child_ids.is_empty() {
-            children_ops.push(DomOp::SetChildren {
+            children_ops.push(BridgeOp::SetChildren {
                 parent: node.locate().0,
                 children: child_ids,
             });
@@ -419,46 +605,62 @@ fn collect_initial_ops(tree: &Tree) -> Vec<DomOp> {
     ops.extend(upserts);
     ops.extend(children_ops);
     if let Some(focus) = state.focus().filter(|n| !should_skip_node(n)) {
-        ops.push(DomOp::SetFocus(Some(focus.locate().0)));
+        ops.push(BridgeOp::SetFocus(Some(focus.locate().0)));
     }
     ops
 }
 
-#[derive(Default)]
-struct DeltaCollector {
-    upserts: Vec<DomNodeSpec>,
-    children_ops: Vec<DomOp>,
+struct DeltaCollector<'a> {
+    specs: &'a mut HashMap<NodeId, DomNodeSpec>,
+    upserts: Vec<(Option<DomNodeSpec>, DomNodeSpec)>,
+    children_ops: Vec<BridgeOp>,
     removals: Vec<NodeId>,
     focus_change: Option<Option<NodeId>>,
 }
 
-impl DeltaCollector {
-    fn into_ops(self) -> Vec<DomOp> {
+impl<'a> DeltaCollector<'a> {
+    fn new(specs: &'a mut HashMap<NodeId, DomNodeSpec>) -> Self {
+        Self {
+            specs,
+            upserts: Vec::new(),
+            children_ops: Vec::new(),
+            removals: Vec::new(),
+            focus_change: None,
+        }
+    }
+
+    fn into_ops(self) -> Vec<BridgeOp> {
         let focus_len = usize::from(self.focus_change.is_some());
         let mut ops = Vec::with_capacity(
             self.upserts.len() + self.children_ops.len() + self.removals.len() + focus_len,
         );
         // Upsert new/changed nodes before wiring parent-child links, detach before
         // removing nodes, and apply focus only after the target is attached.
-        ops.extend(self.upserts.into_iter().map(DomOp::Upsert));
+        ops.extend(
+            self.upserts
+                .into_iter()
+                .map(|(old, spec)| BridgeOp::Upsert { old, spec }),
+        );
         ops.extend(self.children_ops);
-        ops.extend(self.removals.into_iter().map(DomOp::Remove));
+        ops.extend(self.removals.into_iter().map(BridgeOp::Remove));
         if let Some(focus) = self.focus_change {
-            ops.push(DomOp::SetFocus(focus));
+            ops.push(BridgeOp::SetFocus(focus));
         }
         ops
     }
 }
 
-impl TreeChangeHandler for DeltaCollector {
+impl TreeChangeHandler for DeltaCollector<'_> {
     fn node_added(&mut self, node: &Node<'_>) {
         if should_skip_node(node) {
             return;
         }
-        self.upserts.push(map_node(node));
+        let spec = map_node(node);
+        let old = self.specs.insert(spec.id, spec.clone());
+        self.upserts.push((old, spec));
         let children = collect_dom_children(node);
         if !children.is_empty() {
-            self.children_ops.push(DomOp::SetChildren {
+            self.children_ops.push(BridgeOp::SetChildren {
                 parent: node.locate().0,
                 children,
             });
@@ -469,15 +671,15 @@ impl TreeChangeHandler for DeltaCollector {
         if should_skip_node(new_node) {
             return;
         }
-        let old_spec = map_node(old_node);
         let new_spec = map_node(new_node);
-        if old_spec != new_spec {
-            self.upserts.push(new_spec);
+        if self.specs.get(&new_spec.id) != Some(&new_spec) {
+            let old = self.specs.insert(new_spec.id, new_spec.clone());
+            self.upserts.push((old, new_spec));
         }
         let old_children = collect_dom_children(old_node);
         let new_children = collect_dom_children(new_node);
         if old_children != new_children {
-            self.children_ops.push(DomOp::SetChildren {
+            self.children_ops.push(BridgeOp::SetChildren {
                 parent: new_node.locate().0,
                 children: new_children,
             });
@@ -496,7 +698,9 @@ impl TreeChangeHandler for DeltaCollector {
         if should_skip_node(node) {
             return;
         }
-        self.removals.push(node.locate().0);
+        let id = node.locate().0;
+        self.specs.remove(&id);
+        self.removals.push(id);
     }
 }
 
@@ -1014,7 +1218,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let _ = ctx.run_ui(input2, |ui| {
+        let _out2 = ctx.run_ui(input2, |ui| {
             clicked = ui.button("Trigger").clicked();
             ui.add(
                 egui::Slider::new(&mut volume, 0.0..=100.0)
@@ -1037,7 +1241,7 @@ mod tests {
             ))],
             ..Default::default()
         };
-        let _ = ctx.run_ui(input3, |ui| {
+        let _out3 = ctx.run_ui(input3, |ui| {
             let _ = ui.button("Trigger");
             ui.add(
                 egui::Slider::new(&mut volume, 0.0..=100.0)
@@ -1096,5 +1300,223 @@ mod tests {
             y_row0_after < y_row0_before,
             "expected ScrollIntoView to move Row 0 upward: before={y_row0_before}, after={y_row0_after}"
         );
+    }
+
+    #[test]
+    fn maps_composite_table_grid_tree_and_menu_roles() {
+        let root_id = NodeId(100);
+        let grid_id = NodeId(101);
+        let row_id = NodeId(102);
+        let hdr_id = NodeId(103);
+        let cell_id = NodeId(104);
+        let tree_id = NodeId(105);
+        let tree_item_id = NodeId(106);
+        let menu_id = NodeId(107);
+        let menu_item_id = NodeId(108);
+        let orphan_cell_id = NodeId(109);
+        let empty_tree_id = NodeId(110);
+        let unlabelled_img_id = NodeId(111);
+
+        let mut root = AccessKitNode::new(Role::Window);
+        root.set_children(vec![
+            grid_id,
+            tree_id,
+            menu_id,
+            orphan_cell_id,
+            empty_tree_id,
+            unlabelled_img_id,
+        ]);
+
+        let mut grid = AccessKitNode::new(Role::Grid);
+        grid.set_children(vec![row_id]);
+        let mut row = AccessKitNode::new(Role::Row);
+        row.set_children(vec![hdr_id, cell_id]);
+        let mut hdr = AccessKitNode::new(Role::ColumnHeader);
+        hdr.set_label("Name");
+        let mut cell = AccessKitNode::new(Role::Cell);
+        cell.set_value("Alice");
+
+        let mut tree = AccessKitNode::new(Role::Tree);
+        tree.set_children(vec![tree_item_id]);
+        let mut tree_item = AccessKitNode::new(Role::TreeItem);
+        tree_item.set_label("Branch");
+        tree_item.set_toggled(Toggled::True);
+
+        let mut menu = AccessKitNode::new(Role::Menu);
+        menu.set_children(vec![menu_item_id]);
+        let mut menu_item = AccessKitNode::new(Role::MenuItem);
+        menu_item.set_label("Copy");
+
+        let orphan_cell = AccessKitNode::new(Role::Cell);
+        let empty_tree = AccessKitNode::new(Role::Tree);
+        let unlabelled_img = AccessKitNode::new(Role::Image);
+
+        let update = TreeUpdate {
+            nodes: vec![
+                (root_id, root),
+                (grid_id, grid),
+                (row_id, row),
+                (hdr_id, hdr),
+                (cell_id, cell),
+                (tree_id, tree),
+                (tree_item_id, tree_item),
+                (menu_id, menu),
+                (menu_item_id, menu_item),
+                (orphan_cell_id, orphan_cell),
+                (empty_tree_id, empty_tree),
+                (unlabelled_img_id, unlabelled_img),
+            ],
+            tree: Some(AccessKitTreeInfo::new(root_id)),
+            tree_id: TreeId::ROOT,
+            focus: root_id,
+        };
+
+        let mut bridge = TreeBridge::new();
+        let ops = bridge.apply_update(update);
+
+        assert_eq!(find_upsert(&ops, |s| s.id == grid_id).aria_role, Some("grid"));
+        assert_eq!(find_upsert(&ops, |s| s.id == row_id).aria_role, Some("row"));
+        assert_eq!(
+            find_upsert(&ops, |s| s.id == hdr_id).aria_role,
+            Some("columnheader")
+        );
+        assert_eq!(
+            find_upsert(&ops, |s| s.id == cell_id).aria_role,
+            Some("gridcell")
+        );
+        assert_eq!(find_upsert(&ops, |s| s.id == tree_id).aria_role, Some("tree"));
+        assert_eq!(
+            find_upsert(&ops, |s| s.id == tree_item_id).aria_role,
+            Some("treeitem")
+        );
+        assert_eq!(find_upsert(&ops, |s| s.id == menu_id).aria_role, Some("menu"));
+        assert_eq!(
+            find_upsert(&ops, |s| s.id == menu_item_id).aria_role,
+            Some("menuitem")
+        );
+        assert_eq!(find_upsert(&ops, |s| s.id == orphan_cell_id).aria_role, None);
+        assert_eq!(
+            find_upsert(&ops, |s| s.id == empty_tree_id).aria_role,
+            Some("group")
+        );
+        assert_eq!(find_upsert(&ops, |s| s.id == unlabelled_img_id).aria_role, None);
+    }
+
+    #[test]
+    fn apply_update_diff_emits_old_spec_and_tracks_focused_id() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        let mut bridge = TreeBridge::new();
+        let mut checked = false;
+        let mut out1 = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.checkbox(&mut checked, "Agree");
+        });
+        let ops1 = bridge.apply_update_diff(out1.platform_output.accesskit_update.take().unwrap());
+        assert_eq!(bridge.focused_id(), bridge.root_id());
+
+        let cb_id = ops1
+            .iter()
+            .find_map(|op| match op {
+                BridgeOp::Upsert { old, spec } if spec.label.as_deref() == Some("Agree") => {
+                    assert!(old.is_none());
+                    Some(spec.id)
+                }
+                _ => None,
+            })
+            .expect("expected checkbox upsert");
+
+        checked = true;
+        let mut out2 = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::AccessKitActionRequest(focus_action(cb_id))],
+                ..Default::default()
+            },
+            |ui| {
+                ui.checkbox(&mut checked, "Agree");
+            },
+        );
+        let ops2 = bridge.apply_update_diff(out2.platform_output.accesskit_update.take().unwrap());
+
+        assert_eq!(bridge.focused_id(), Some(cb_id));
+        let updated = ops2.iter().find_map(|op| match op {
+            BridgeOp::Upsert { old, spec } if spec.id == cb_id => Some((old.as_ref(), spec)),
+            _ => None,
+        });
+        let (old, spec) = updated.expect("expected diff upsert for checkbox");
+        assert_eq!(old.unwrap().toggled, Some(Toggled::False));
+        assert_eq!(spec.toggled, Some(Toggled::True));
+    }
+
+    #[test]
+    fn fallback_text_edit_events_update_egui_widgets() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+
+        let mut note = String::from("hello");
+        let mut secret = String::from("abc");
+        let mut bridge = TreeBridge::new();
+
+        let mut out1 = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.text_edit_singleline(&mut note);
+            ui.add(egui::TextEdit::singleline(&mut secret).password(true));
+        });
+        let ops1 = bridge.apply_update(out1.platform_output.accesskit_update.take().unwrap());
+
+        let note_id = find_upsert(&ops1, |s| s.input_type == Some("text")).id;
+        let pw_id = find_upsert(&ops1, |s| s.input_type == Some("password")).id;
+
+        // Pass 1: focus note TextEdit.
+        let mut out_focus = ctx.run_ui(
+            egui::RawInput {
+                events: vec![Event::AccessKitActionRequest(focus_action(note_id))],
+                ..Default::default()
+            },
+            |ui| {
+                ui.text_edit_singleline(&mut note);
+                ui.add(egui::TextEdit::singleline(&mut secret).password(true));
+            },
+        );
+        let _ = bridge.apply_update(out_focus.platform_output.accesskit_update.take().unwrap());
+        assert_eq!(bridge.focused_id(), Some(note_id));
+
+        // Pass 2: replace full value via fallback events (Key::A + Backspace + Paste).
+        let mut out_set = ctx.run_ui(
+            egui::RawInput {
+                events: TreeBridge::fallback_set_value_events(String::from("replaced")),
+                ..Default::default()
+            },
+            |ui| {
+                ui.text_edit_singleline(&mut note);
+                ui.add(egui::TextEdit::singleline(&mut secret).password(true));
+            },
+        );
+        let _ = bridge.apply_update(out_set.platform_output.accesskit_update.take().unwrap());
+        assert_eq!(note, "replaced");
+
+        // Pass 3: focus password field, then edit a UTF-16 range via fallback_replace_range_events.
+        let mut out_pw_focus = ctx.run_ui(
+            egui::RawInput {
+                events: vec![Event::AccessKitActionRequest(focus_action(pw_id))],
+                ..Default::default()
+            },
+            |ui| {
+                ui.text_edit_singleline(&mut note);
+                ui.add(egui::TextEdit::singleline(&mut secret).password(true));
+            },
+        );
+        let _ = bridge.apply_update(out_pw_focus.platform_output.accesskit_update.take().unwrap());
+
+        let _out_pw_edit = ctx.run_ui(
+            egui::RawInput {
+                events: bridge.fallback_replace_range_events(pw_id, 3, 3, String::from("!")),
+                ..Default::default()
+            },
+            |ui| {
+                ui.text_edit_singleline(&mut note);
+                ui.add(egui::TextEdit::singleline(&mut secret).password(true));
+            },
+        );
+        assert_eq!(secret, "abc!");
     }
 }
