@@ -7,6 +7,18 @@ The crate versions mirror `egui`'s minor version:
 - `0.36.x` (`egui-0.36` branch) targets `egui` / `eframe` `0.36`
 - `0.35.x` (`egui-0.35` branch) targets `egui` / `eframe` `0.35`
 
+## Unreleased
+
+### Fixed
+- Keyboard activation of a dialog trigger (Enter or Space) no longer drops DOM focus to `document.body`. The modal's `inert` background is applied to the focused trigger, so the bridge now moves focus into the dialog, traps `Tab` / `Shift+Tab` inside it, and restores focus to the trigger on close.
+- Typing and Backspace in text fields no longer rewrite `aria-label` on every keystroke, which screen readers announced again (for example as "blank" once the field was empty).
+- Password fields no longer expose three mask glyphs per character. The DOM mask is now ASCII `*`, which Chromium exposes as one glyph per character.
+- `aria-autocomplete` is no longer emitted by default. It is mirrored only when the application sets `Node::set_auto_complete`.
+
+### Testing & Demo
+- Added Playwright regression tests for keyboard dialog focus, Backspace attribute churn, password mask exposure, and `aria-autocomplete`. `PW_CHROME_PATH` selects a specific Chromium binary for `npm test`.
+- Demo gained an explicitly autocompleted `Search:` field.
+
 ## 0.37.4 / 0.36.4 / 0.35.4
 
 ### Performance
