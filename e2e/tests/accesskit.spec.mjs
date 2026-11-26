@@ -657,6 +657,53 @@ test.describe("egui-web-accesskit E2E", () => {
     expect(errors).toEqual([]);
   });
 
+  test("?bridge=off mounts no mirror while the canvas still renders", async ({ page }) => {
+    const errors = [];
+    page.on("pageerror", (err) => errors.push(err.message));
+    page.on("console", (msg) => {
+      if (msg.type() === "error") errors.push(msg.text());
+    });
+    await page.addInitScript(() => {
+      window.__mirrorMounted = false;
+      new MutationObserver(() => {
+        if (document.querySelector('[data-egui-accesskit="true"]')) window.__mirrorMounted = true;
+      }).observe(document, { childList: true, subtree: true });
+    });
+
+    await page.goto("/?bridge=off");
+    await expect(page.locator("#the_canvas_id")).toBeVisible();
+    await page.waitForLoadState("networkidle");
+    await settleFrames(page);
+    // No mirror may appear within a bounded wait after the app has loaded.
+    await page.waitForTimeout(1500);
+
+    expect(await page.evaluate(() => window.__mirrorMounted)).toBe(false);
+    await expect(page.locator('[data-egui-accesskit="true"]')).toHaveCount(0);
+    expect(errors).toEqual([]);
+  });
+
+  test("the mirror toggle button reloads the page with the bridge disabled", async ({ page }) => {
+    const errors = [];
+    page.on("pageerror", (err) => errors.push(err.message));
+    page.on("console", (msg) => {
+      if (msg.type() === "error") errors.push(msg.text());
+    });
+
+    await page.goto("/");
+    const overlay = page.locator('[data-egui-accesskit="true"]');
+    await expect(overlay).toBeAttached({ timeout: 15000 });
+
+    await overlay
+      .getByRole("button", { name: "Turn screen reader mirror off" })
+      .evaluate((el) => el.click());
+    await page.waitForURL(/bridge=off/, { timeout: 15000 });
+    await page.waitForLoadState("networkidle");
+    await page.waitForTimeout(1500);
+    await expect(page.locator('[data-egui-accesskit="true"]')).toHaveCount(0);
+    await expect(page.locator("#the_canvas_id")).toBeVisible();
+    expect(errors).toEqual([]);
+  });
+
   test("supports Shadow DOM via WebAccessKitPlugin::from_canvas", async ({ page }) => {
     const errors = [];
     page.on("pageerror", (err) => errors.push(err.message));

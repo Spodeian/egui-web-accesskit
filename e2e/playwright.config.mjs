@@ -1,11 +1,20 @@
 import { defineConfig } from "@playwright/test";
 
+// PW_BASE_URL switches the config to "live" mode: the smoke spec runs against a deployed site
+// (for example https://<owner>.github.io/egui-web-accesskit/main/) and no local server is started.
+const liveBaseUrl = process.env.PW_BASE_URL;
+
 export default defineConfig({
   testDir: "./tests",
+  testMatch: liveBaseUrl ? "smoke.spec.mjs" : "accesskit.spec.mjs",
   timeout: 30000,
+  // Retries stay at 0 so flakes are visible instead of being masked.
+  retries: 0,
+  reporter: [["list"], ["html", { open: "never", outputFolder: "playwright-report" }]],
   use: {
-    baseURL: "http://127.0.0.1:4173",
+    baseURL: liveBaseUrl ?? "http://127.0.0.1:4173",
     headless: true,
+    trace: "off",
   },
   projects: [
     {
@@ -32,9 +41,11 @@ export default defineConfig({
       },
     },
   ],
-  webServer: {
-    command: "node serve.mjs",
-    url: "http://127.0.0.1:4173",
-    reuseExistingServer: false,
-  },
+  webServer: liveBaseUrl
+    ? undefined
+    : {
+        command: "node serve.mjs",
+        url: "http://127.0.0.1:4173",
+        reuseExistingServer: false,
+      },
 });
