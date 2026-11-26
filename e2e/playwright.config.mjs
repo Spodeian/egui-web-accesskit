@@ -38,6 +38,9 @@ export default defineConfig({
       name: "firefox",
       use: {
         browserName: "firefox",
+        // Headless Firefox cannot create a WebGL context on CI runners, so eframe never starts.
+        // Set PW_FIREFOX_HEADED=1 and run under xvfb-run to test with a headed Firefox.
+        headless: process.env.PW_FIREFOX_HEADED !== "1",
       },
     },
   ],

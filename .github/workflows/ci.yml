@@ -42,6 +42,24 @@ jobs:
       - name: Demo builds natively as the browser-only stub
         run: (cd examples/demo && cargo build)
 
+  wasm-tests:
+    name: wasm32 unit tests (wasm-bindgen-test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          # Must match the wasm-bindgen version in Cargo.lock (0.2.130).
+          tool: wasm-bindgen-cli@0.2.130
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - run: cargo test --target wasm32-unknown-unknown
+
   licenses:
     name: Dependency licences
     runs-on: ubuntu-latest
@@ -127,11 +145,35 @@ jobs:
         with:
           name: demo-dist
           path: examples/demo/dist
-      - working-directory: e2e
-        run: |
-          npm ci
-          npx playwright install --with-deps firefox
-          npx playwright test --project=firefox
+      - name: Install e2e dependencies (verbose, timeout-bounded)
+        working-directory: e2e
+        timeout-minutes: 10
+        run: npm ci --loglevel verbose
+      - name: Install Firefox
+        working-directory: e2e
+        run: npx playwright install --with-deps firefox
+      - name: Virtual display and Mesa GL for headed Firefox
+        run: sudo apt-get update -y && sudo apt-get install -y xvfb libgl1-mesa-dri libgl1
+      - name: "Firefox suite (headed under Xvfb; headless Firefox has no WebGL here)"
+        working-directory: e2e
+        env:
+          PW_FIREFOX_HEADED: "1"
+        run: xvfb-run -a -s "-screen 0 1280x1024x24" npx playwright test --project=firefox
+      - name: Upload Firefox Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: firefox-playwright-report
+          path: e2e/playwright-report
+          retention-days: 14
+      - name: Upload npm log on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: firefox-npm-log
+          path: ~/.npm/_logs
+          if-no-files-found: ignore
+          retention-days: 14
 
   deploy:
     name: Publish demo to GitHub Pages (per branch)

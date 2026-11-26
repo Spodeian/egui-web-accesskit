@@ -1,6 +1,14 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test } from "@playwright/test";
 
+/** Clicks an element with a real mouse press at its centre, as a sighted user would. */
+async function clickWithMouse(page, locator) {
+  await locator.scrollIntoViewIfNeeded();
+  const box = await locator.boundingBox();
+  if (!box) throw new Error("element has no bounding box to click");
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+}
+
 /** Waits for two animation frames, so any DOM mutation caused by the last input has run. */
 async function settleFrames(page) {
   await page.evaluate(
@@ -90,14 +98,14 @@ test.describe("egui-web-accesskit E2E", () => {
     expect(axeResults.violations).toEqual([]);
 
     // 2. Idle wakeup & click round-trip + toggle button, live region, radio group, spinbutton
-    await incBtn.evaluate((el) => el.click());
+    await clickWithMouse(page, incBtn);
     await expect(overlay.getByText("Button clicked 1 times")).toBeAttached();
 
-    await muteBtn.evaluate((el) => el.click());
+    await clickWithMouse(page, muteBtn);
     await expect(muteBtn).toHaveAttribute("aria-pressed", "true");
     await expect(liveStatus).toHaveText("Audio muted");
 
-    await spaciousRadio.evaluate((el) => el.click());
+    await clickWithMouse(page, spaciousRadio);
     await expect(spaciousRadio).toHaveAttribute("aria-checked", "true");
     await expect(compactRadio).toHaveAttribute("aria-checked", "false");
 
@@ -109,7 +117,7 @@ test.describe("egui-web-accesskit E2E", () => {
     await expect(retriesSpin).toHaveValue("7");
 
     // 2b. ComboBox open popup, hoisted options, axe-core check while open, keyboard Enter, and close
-    await themeCombo.evaluate((el) => el.click());
+    await clickWithMouse(page, themeCombo);
     await expect(themeCombo).toHaveAttribute("aria-expanded", "true");
     const controlsId = await themeCombo.getAttribute("aria-controls");
     expect(controlsId).toBeTruthy();
@@ -129,11 +137,11 @@ test.describe("egui-web-accesskit E2E", () => {
     await page.keyboard.press("Enter");
     await expect(themeCombo).toHaveText("Light");
     await expect(lightOpt).toHaveAttribute("aria-selected", "true");
-    await themeCombo.evaluate((el) => el.click());
+    await clickWithMouse(page, themeCombo);
     await expect(themeCombo).toHaveAttribute("aria-expanded", "false");
 
     // 2c. Modal AlertDialog + background inert trapping + axe-core check while open + close
-    await overlay.getByRole("button", { name: "Open dialog" }).evaluate((el) => el.click());
+    await clickWithMouse(page, overlay.getByRole("button", { name: "Open dialog" }));
     const modal = overlay.getByRole("alertdialog", { name: "Confirmation dialog" });
     await expect(modal).toBeAttached();
     await expect(modal).toHaveAttribute("aria-modal", "true");
@@ -146,11 +154,11 @@ test.describe("egui-web-accesskit E2E", () => {
       .analyze();
     expect(modalAxe.violations).toEqual([]);
 
-    await overlay.getByRole("button", { name: "Close dialog" }).evaluate((el) => el.click());
+    await clickWithMouse(page, overlay.getByRole("button", { name: "Close dialog" }));
     await expect(modal).toHaveCount(0);
     expect(await incBtn.evaluate((el) => el.closest("[inert]") !== null)).toBe(false);
 
-    await overlay.getByRole("button", { name: "Open dialog" }).evaluate((el) => el.click());
+    await clickWithMouse(page, overlay.getByRole("button", { name: "Open dialog" }));
     await expect(modal).toBeAttached();
     await overlay.getByRole("button", { name: "Close dialog" }).focus();
     await page.keyboard.press("Escape");
@@ -158,7 +166,7 @@ test.describe("egui-web-accesskit E2E", () => {
     expect(await incBtn.evaluate((el) => el.closest("[inert]") !== null)).toBe(false);
 
     // 3. Disclosure click & aria-expanded update
-    await detailsBtn.evaluate((el) => el.click());
+    await clickWithMouse(page, detailsBtn);
     await expect(detailsBtn).toHaveAttribute("aria-expanded", "true");
     await expect(overlay.getByText("Hidden detail text")).toBeAttached();
 
@@ -181,7 +189,7 @@ test.describe("egui-web-accesskit E2E", () => {
     await page.keyboard.press("Enter");
     await expect(overlay.getByText("Note submits: 1")).toBeAttached();
 
-    await overlay.getByRole("button", { name: "Clear note" }).evaluate((el) => el.click());
+    await clickWithMouse(page, overlay.getByRole("button", { name: "Clear note" }));
     await expect(noteBox).toHaveValue("");
 
     // 5b. IME composition defers sync until compositionend commits
@@ -199,7 +207,7 @@ test.describe("egui-web-accesskit E2E", () => {
       );
     });
     const toggleWarningBtn = overlay.getByRole("button", { name: "Toggle warning" });
-    await toggleWarningBtn.evaluate((el) => el.click());
+    await clickWithMouse(page, toggleWarningBtn);
     await expect(overlay.getByText("Warning banner")).toBeAttached();
     await expect(noteBox).toHaveValue("ka");
     await noteBox.evaluate((el) => {
@@ -207,8 +215,8 @@ test.describe("egui-web-accesskit E2E", () => {
       el.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "漢" }));
     });
     await expect(noteBox).toHaveValue("漢");
-    await toggleWarningBtn.evaluate((el) => el.click());
-    await overlay.getByRole("button", { name: "Clear note" }).evaluate((el) => el.click());
+    await clickWithMouse(page, toggleWarningBtn);
+    await clickWithMouse(page, overlay.getByRole("button", { name: "Clear note" }));
     await expect(noteBox).toHaveValue("");
 
     // 6. Multiline <textarea>, placeholder, selection sync, read-only input, and ScrollIntoView
@@ -324,7 +332,7 @@ test.describe("egui-web-accesskit E2E", () => {
     const boxBefore = await incBtn.boundingBox();
     expect(boxBefore).not.toBeNull();
 
-    await overlay.getByRole("button", { name: "Zoom 1.5x" }).evaluate((el) => el.click());
+    await clickWithMouse(page, overlay.getByRole("button", { name: "Zoom 1.5x" }));
 
     await expect
       .poll(async () => {
@@ -405,7 +413,7 @@ test.describe("egui-web-accesskit E2E", () => {
     await expect(overlay).toBeAttached({ timeout: 15000 });
 
     const noteBox = overlay.getByRole("textbox", { name: "Note:" });
-    await overlay.getByRole("button", { name: "Clear note" }).evaluate((el) => el.click());
+    await clickWithMouse(page, overlay.getByRole("button", { name: "Clear note" }));
     await expect(noteBox).toHaveValue("");
 
     await noteBox.focus();
@@ -712,6 +720,33 @@ test.describe("egui-web-accesskit E2E", () => {
     expect(errors).toEqual([]);
   });
 
+  test("changing a heading level recreates only that element and keeps focus on the control", async ({
+    page,
+  }) => {
+    const errors = [];
+    page.on("pageerror", (err) => errors.push(err.message));
+    page.on("console", (msg) => {
+      if (msg.type() === "error") errors.push(msg.text());
+    });
+
+    await page.goto("/");
+    const overlay = page.locator('[data-egui-accesskit="true"]');
+    await expect(overlay).toBeAttached({ timeout: 15000 });
+
+    const heading = overlay.getByRole("heading", { name: "Section heading (level 2)", level: 2 });
+    await expect(heading).toBeAttached();
+    const changeBtn = overlay.getByRole("button", { name: "Change section heading level" });
+    await changeBtn.focus();
+    await page.keyboard.press("Enter");
+
+    const heading3 = overlay.getByRole("heading", { name: "Section heading (level 3)", level: 3 });
+    await expect(heading3).toBeAttached();
+    await expect(heading3).toHaveJSProperty("tagName", "H3");
+    // Recreating the heading must not move focus: the control that changed it keeps it.
+    await expect(changeBtn).toBeFocused();
+    expect(errors).toEqual([]);
+  });
+
   test("supports Shadow DOM via WebAccessKitPlugin::from_canvas", async ({ page }) => {
     const errors = [];
     page.on("pageerror", (err) => errors.push(err.message));
@@ -749,6 +784,16 @@ test.describe("egui-web-accesskit E2E", () => {
       el.focus();
       el.setSelectionRange(0, el.value.length);
     });
+    // Typing must replace the whole value. Wait until the selection is really full, and still
+    // full after two frames, so a late selection update from the bridge cannot be typed over.
+    const fullSelection = () =>
+      shadowOverlay.getByRole("textbox", { name: "Note:" }).evaluate((el) => {
+        const length = el.value.length;
+        return el.selectionStart === 0 && el.selectionEnd === length;
+      });
+    await expect.poll(fullSelection).toBe(true);
+    await settleFrames(page);
+    expect(await fullSelection()).toBe(true);
     await page.keyboard.type("!shadow");
     await expect(shadowOverlay.getByText("Warning banner")).toBeAttached();
     const activeInShadow = await noteBox.evaluate((el) => {
@@ -806,12 +851,14 @@ test.describe("egui-web-accesskit E2E", () => {
     await expect(activateBtn).toBeAttached({ timeout: 15000 });
     await expect(overlay.getByRole("button", { name: "Increment counter" })).toHaveCount(0);
 
+    // The activation control is a 1px, pointer-events:none element meant for assistive technology.
+    // Sighted mouse users cannot reach it, so this test activates it through the DOM on purpose.
     await activateBtn.evaluate((el) => el.click());
     await expect(activateBtn).toHaveCount(0);
 
     const incBtn = overlay.getByRole("button", { name: "Increment counter" });
     await expect(incBtn).toBeAttached({ timeout: 15000 });
-    await incBtn.evaluate((el) => el.click());
+    await clickWithMouse(page, incBtn);
     await expect(overlay.getByText("Button clicked 1 times")).toBeAttached();
 
     expect(errors).toEqual([]);

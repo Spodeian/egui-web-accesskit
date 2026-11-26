@@ -2667,3 +2667,107 @@ fn push_events(
         cb();
     }
 }
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod tests {
+    use super::*;
+    use egui::accesskit::NodeId;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    /// A minimal node spec: every optional field empty, the caller sets what a test needs.
+    fn spec(
+        aria_role: Option<&'static str>,
+        label: Option<&str>,
+        value: Option<&str>,
+    ) -> DomNodeSpec {
+        DomNodeSpec {
+            id: NodeId(1),
+            tag: DomTag::Div,
+            aria_role,
+            input_type: None,
+            label: label.map(str::to_owned),
+            description: None,
+            value: value.map(str::to_owned),
+            placeholder: None,
+            url: None,
+            toggled: None,
+            expanded: None,
+            clickable: false,
+            disabled: false,
+            read_only: false,
+            focusable: false,
+            heading_level: None,
+            modal: false,
+            live: None,
+            numeric_value: None,
+            numeric_min: None,
+            numeric_max: None,
+            numeric_step: None,
+            text_selection: None,
+            bounds: None,
+            required: false,
+            invalid: None,
+            error_message: None,
+            described_by: Vec::new(),
+            active_descendant: None,
+            orientation: None,
+            position_in_set: None,
+            size_of_set: None,
+            row_count: None,
+            column_count: None,
+            row_index: None,
+            column_index: None,
+            auto_complete: None,
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn password_mask_turns_each_egui_bullet_into_one_ascii_glyph() {
+        assert_eq!(dom_password_mask("•••"), "***");
+        assert_eq!(dom_password_mask("●a●"), "*a*");
+        assert_eq!(dom_password_mask(""), "");
+    }
+
+    #[wasm_bindgen_test]
+    fn mask_detection_accepts_both_egui_bullets_and_the_dom_glyph() {
+        assert!(is_password_mask_char('*'));
+        assert!(is_password_mask_char('•'));
+        assert!(is_password_mask_char('●'));
+        assert!(!is_password_mask_char('a'));
+    }
+
+    #[wasm_bindgen_test]
+    fn password_diff_reports_insertions_replacements_and_deletions_in_utf16() {
+        // Typed at the end: insert "x" at offset 3, nothing replaced.
+        assert_eq!(password_diff_utf16("***", "***x"), (3, 3, "x".to_owned()));
+        // Last character replaced.
+        assert_eq!(password_diff_utf16("**a", "**b"), (2, 3, "b".to_owned()));
+        // Backspace: the trailing mask is removed.
+        assert_eq!(password_diff_utf16("***", "**"), (2, 3, String::new()));
+    }
+
+    #[wasm_bindgen_test]
+    fn accessible_name_prefers_the_explicit_label() {
+        assert_eq!(
+            accessible_name(&spec(None, Some("Name"), None)),
+            Some("Name")
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn accessible_name_falls_back_by_role_and_combobox_value() {
+        assert_eq!(
+            accessible_name(&spec(Some("dialog"), None, None)),
+            Some("Dialog")
+        );
+        assert_eq!(
+            accessible_name(&spec(Some("combobox"), None, Some("Dark"))),
+            Some("Dark")
+        );
+        assert_eq!(
+            accessible_name(&spec(Some("combobox"), None, Some(""))),
+            Some("Select")
+        );
+        assert_eq!(accessible_name(&spec(None, None, None)), None);
+    }
+}
