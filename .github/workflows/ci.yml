@@ -152,9 +152,13 @@ jobs:
       - name: Install Firefox
         working-directory: e2e
         run: npx playwright install --with-deps firefox
-      - name: Firefox suite
+      - name: Virtual display for headed Firefox
+        run: sudo apt-get update -y && sudo apt-get install -y xvfb
+      - name: "Firefox suite (headed under Xvfb; headless Firefox has no WebGL here)"
         working-directory: e2e
-        run: npx playwright test --project=firefox
+        env:
+          PW_FIREFOX_HEADED: "1"
+        run: xvfb-run -a npx playwright test --project=firefox
       - name: Upload npm log on failure
         if: failure()
         uses: actions/upload-artifact@v7
