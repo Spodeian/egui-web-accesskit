@@ -3,6 +3,7 @@ name = "egui-web-accesskit-demo"
 version = "0.1.0"
 edition = "2024"
 publish = false
+license = "MIT OR Apache-2.0"
 
 # This demo is deployed to the browser only. The egui and bridge dependencies are therefore
 # restricted to wasm32, so a native build compiles to a stub that explains how to run it.
@@ -30,3 +31,12 @@ web-sys = { version = "0.3", features = [
     "ShadowRootMode",
     "Window",
 ] }
+
+# Release profile for the public build. Profiles are read from the root of the package being
+# built, and this demo is its own package (no [workspace]), so it must be set here.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

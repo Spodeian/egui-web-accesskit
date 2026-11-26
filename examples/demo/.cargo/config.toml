@@ -1,0 +1,8 @@
+# wasm32 baseline for the public demo. These features are supported by every browser the demo
+# targets, including mobile WebKit (Safari, iOS). target-cpu=generic avoids host-specific code.
+[target.wasm32-unknown-unknown]
+rustflags = [
+    "-C", "target-feature=+bulk-memory,+mutable-globals,+nontrapping-fptoint,+sign-ext,+reference-types",
+    "-C", "link-arg=-zstack-size=2097152",
+    "-C", "target-cpu=generic",
+]

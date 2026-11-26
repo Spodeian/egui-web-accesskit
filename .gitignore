@@ -1,7 +1,6 @@
 /target
 /Cargo.lock
 examples/demo/target
-examples/demo/Cargo.lock
 examples/demo/dist
 e2e/node_modules
 e2e/test-results
