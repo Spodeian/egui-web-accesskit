@@ -61,6 +61,8 @@ struct DemoApp {
     torn_down: bool,
     /// Whether the bridge was registered at startup (`false` when the page was opened with `?bridge=off`).
     mirror_on: bool,
+    /// Level of the "Section heading" (2 or 3). Changing it recreates the heading's element.
+    section_level: u8,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -91,6 +93,7 @@ impl Default for DemoApp {
             teardown_frames: None,
             torn_down: false,
             mirror_on: true,
+            section_level: 2,
         }
     }
 }
@@ -299,6 +302,17 @@ impl eframe::App for DemoApp {
                         ui.selectable_value(&mut self.theme, DemoTheme::Dark, "Dark");
                         ui.selectable_value(&mut self.theme, DemoTheme::Light, "Light");
                     });
+
+                let section_name = format!("Section heading (level {})", self.section_level);
+                let section = cols[1].heading(section_name);
+                let section_level = usize::from(self.section_level);
+                cols[1].ctx().accesskit_node_builder(section.id, |node| {
+                    node.set_role(egui::accesskit::Role::Heading);
+                    node.set_level(section_level);
+                });
+                if cols[1].button("Change section heading level").clicked() {
+                    self.section_level = if self.section_level == 2 { 3 } else { 2 };
+                }
 
                 if cols[1].button("Open dialog").clicked() {
                     self.show_modal = true;
