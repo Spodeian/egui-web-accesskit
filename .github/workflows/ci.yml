@@ -2,53 +2,245 @@ name: CI
 
 on:
   push:
-    branches:
-      - main
-      - egui-0.36
-      - egui-0.35
+    branches: [main, egui-0.36, egui-0.35]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
+  # Pinned tool versions. Keep in sync with examples/demo/build-dist.sh and the docs.
+  TRUNK_VERSION: 0.22.2
+  BINARYEN_VERSION: version_132
+
+permissions:
+  contents: read
 
 jobs:
   check:
+    name: Rust checks (native and wasm32)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
-          components: clippy
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Formatting (crate and demo)
+        run: |
+          cargo fmt --check
+          (cd examples/demo && cargo fmt --check)
       - run: cargo test
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
-      - env:
+      - name: Docs with warnings denied
+        env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --no-deps
-      - env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --no-deps --target wasm32-unknown-unknown
+        run: |
+          cargo doc --no-deps
+          cargo doc --no-deps --target wasm32-unknown-unknown
+      - name: Demo builds natively as the browser-only stub
+        run: (cd examples/demo && cargo build)
 
-  e2e:
+  licenses:
+    name: Dependency licences
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny --all-features check licenses
+
+  e2e:
+    name: Browser end-to-end (Chromium)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@trunk
-      - uses: actions/setup-node@v4
+        with:
+          workspaces: examples/demo
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: trunk@${{ env.TRUNK_VERSION }}
+      - name: Cache wasm-opt (Binaryen ${{ env.BINARYEN_VERSION }})
+        id: cache-wasm-opt
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/bin/wasm-opt
+          key: ${{ runner.os }}-wasm-opt-${{ env.BINARYEN_VERSION }}
+      - name: Install wasm-opt
+        if: steps.cache-wasm-opt.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.cargo/bin
+          url="https://github.com/WebAssembly/binaryen/releases/download/${BINARYEN_VERSION}/binaryen-${BINARYEN_VERSION}-x86_64-linux.tar.gz"
+          curl --proto '=https' --tlsv1.2 -sSfL "$url" | tar -xzf - -C "$RUNNER_TEMP"
+          mv "$RUNNER_TEMP/binaryen-${BINARYEN_VERSION}/bin/wasm-opt" ~/.cargo/bin/wasm-opt
+      - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: e2e/package-lock.json
-      - working-directory: examples/demo
-        run: trunk build
+      - name: Build demo (release, optimised)
+        run: examples/demo/build-dist.sh /
+      - name: Install e2e dependencies
+        working-directory: e2e
+        run: |
+          npm ci
+          npm run format:check
+          npx playwright install --with-deps chrome
+      - name: End-to-end suite
+        working-directory: e2e
+        run: npm test
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report
+          path: e2e/playwright-report
+          retention-days: 14
+      - name: Upload demo build for the Firefox job
+        uses: actions/upload-artifact@v7
+        with:
+          name: demo-dist
+          path: examples/demo/dist
+          retention-days: 1
+
+  firefox:
+    name: Browser end-to-end (Firefox, not yet required)
+    needs: e2e
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+      - uses: actions/download-artifact@v7
+        with:
+          name: demo-dist
+          path: examples/demo/dist
+      - working-directory: e2e
+        run: |
+          npm ci
+          npx playwright install --with-deps firefox
+          npx playwright test --project=firefox
+
+  deploy:
+    name: Publish demo to GitHub Pages (per branch)
+    needs: [check, licenses, e2e]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: trunk@${{ env.TRUNK_VERSION }}
+      - name: Install wasm-opt
+        run: |
+          mkdir -p ~/.cargo/bin
+          url="https://github.com/WebAssembly/binaryen/releases/download/${BINARYEN_VERSION}/binaryen-${BINARYEN_VERSION}-x86_64-linux.tar.gz"
+          curl --proto '=https' --tlsv1.2 -sSfL "$url" | tar -xzf - -C "$RUNNER_TEMP"
+          mv "$RUNNER_TEMP/binaryen-${BINARYEN_VERSION}/bin/wasm-opt" ~/.cargo/bin/wasm-opt
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Build each branch under its own path
+        run: |
+          set -euo pipefail
+          rm -rf site && mkdir -p site
+          for branch in main egui-0.36 egui-0.35; do
+            git worktree add --detach "src-$branch" "origin/$branch"
+            (cd "src-$branch" && examples/demo/build-dist.sh "/egui-web-accesskit/$branch/")
+            mkdir -p "site/$branch"
+            cp -r "src-$branch/examples/demo/dist/." "site/$branch/"
+          done
+          cat > site/index.html <<'HTML'
+          <!doctype html>
+          <html lang="en">
+            <head>
+              <meta charset="utf-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1">
+              <title>egui-web-accesskit demos</title>
+            </head>
+            <body>
+              <main>
+                <h1>egui-web-accesskit demos</h1>
+                <p>Each link is the wasm demo built from that branch.</p>
+                <ul>
+                  <li><a href="./main/">main (egui 0.37)</a></li>
+                  <li><a href="./egui-0.36/">egui-0.36 branch</a></li>
+                  <li><a href="./egui-0.35/">egui-0.35 branch</a></li>
+                </ul>
+              </main>
+            </body>
+          </html>
+          HTML
+      - uses: actions/configure-pages@v6
+        id: setup-pages
+        continue-on-error: true
+      - name: Upload site artifact (Pages)
+        if: steps.setup-pages.outcome == 'success'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+      - name: Upload site artifact (fallback when Pages is not configured)
+        if: steps.setup-pages.outcome != 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: demo-site
+          path: site
+          retention-days: 14
+      - name: Deploy to GitHub Pages
+        if: steps.setup-pages.outcome == 'success'
+        id: deployment
+        uses: actions/deploy-pages@v5
+
+  smoke:
+    name: Post-deploy smoke test (live URLs)
+    needs: deploy
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
       - working-directory: e2e
         run: |
           npm ci
           npx playwright install --with-deps chrome
-          npm test
+      - name: Smoke test each deployed branch
+        working-directory: e2e
+        env:
+          SITE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+        run: |
+          for branch in main egui-0.36 egui-0.35; do
+            echo "== $branch"
+            PW_BASE_URL="$SITE_URL/$branch/" npx playwright test --project=chrome
+          done
