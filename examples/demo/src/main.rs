@@ -59,6 +59,8 @@ struct DemoApp {
     /// Frames left before `WebAccessKitPlugin::teardown` runs (set by `?teardown=1`).
     teardown_frames: Option<u32>,
     torn_down: bool,
+    /// Whether the bridge was registered at startup (`false` when the page was opened with `?bridge=off`).
+    mirror_on: bool,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -88,6 +90,7 @@ impl Default for DemoApp {
             dialog_confirmed: false,
             teardown_frames: None,
             torn_down: false,
+            mirror_on: true,
         }
     }
 }
@@ -311,6 +314,20 @@ impl eframe::App for DemoApp {
                 if self.torn_down {
                     cols[1].label("Accessibility mirror: torn down");
                 }
+                let (mirror_button, next_mirror_on) = if self.mirror_on {
+                    ("Turn screen reader mirror off", false)
+                } else {
+                    ("Turn screen reader mirror on", true)
+                };
+                if cols[1].button(mirror_button).clicked() {
+                    toggle_mirror_location(next_mirror_on);
+                }
+                if !self.mirror_on {
+                    cols[1].label(
+                        "Screen reader mirror is off: the page has no DOM overlay. \
+                         Press the button again from the page with the mirror on.",
+                    );
+                }
             });
 
             if self.show_modal {
@@ -354,6 +371,16 @@ fn main() {
     std::process::exit(1);
 }
 
+/// Reloads the page with the bridge enabled or disabled. egui keeps one plugin per type, so a
+/// mounted bridge cannot be re-added in place; a reload is the reliable way to switch it.
+#[cfg(target_arch = "wasm32")]
+fn toggle_mirror_location(mirror_on: bool) {
+    if let Some(window) = web_sys::window() {
+        let search = if mirror_on { "" } else { "?bridge=off" };
+        let _ = window.location().set_search(search);
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 fn main() {
     use wasm_bindgen::JsCast as _;
@@ -371,6 +398,7 @@ fn main() {
         let shadow_mode = search.contains("shadow=1");
         let lazy_mode = search.contains("lazy=1");
         let teardown_mode = search.contains("teardown=1");
+        let mirror_on = !search.contains("bridge=off");
 
         let plugin = if shadow_mode {
             canvas.remove();
@@ -402,8 +430,13 @@ fn main() {
                 canvas,
                 web_options,
                 Box::new(move |cc| {
-                    cc.egui_ctx.add_plugin(plugin);
-                    let mut app = DemoApp::default();
+                    if mirror_on {
+                        cc.egui_ctx.add_plugin(plugin);
+                    }
+                    let mut app = DemoApp {
+                        mirror_on,
+                        ..DemoApp::default()
+                    };
                     if teardown_mode {
                         app.teardown_frames = Some(3);
                     }
