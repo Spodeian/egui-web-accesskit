@@ -784,6 +784,16 @@ test.describe("egui-web-accesskit E2E", () => {
       el.focus();
       el.setSelectionRange(0, el.value.length);
     });
+    // Typing must replace the whole value. Wait until the selection is really full, and still
+    // full after two frames, so a late selection update from the bridge cannot be typed over.
+    const fullSelection = () =>
+      shadowOverlay.getByRole("textbox", { name: "Note:" }).evaluate((el) => {
+        const length = el.value.length;
+        return el.selectionStart === 0 && el.selectionEnd === length;
+      });
+    await expect.poll(fullSelection).toBe(true);
+    await settleFrames(page);
+    expect(await fullSelection()).toBe(true);
     await page.keyboard.type("!shadow");
     await expect(shadowOverlay.getByText("Warning banner")).toBeAttached();
     const activeInShadow = await noteBox.evaluate((el) => {
