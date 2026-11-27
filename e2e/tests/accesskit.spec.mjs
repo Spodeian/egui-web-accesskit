@@ -597,14 +597,19 @@ test.describe("egui-web-accesskit E2E", () => {
     const trigger = overlay.getByRole("button", { name: "Open dialog" });
     await trigger.focus();
     await page.keyboard.press("Enter");
-    await overlay.getByRole("button", { name: "Cancel" }).focus();
+    const cancel = overlay.getByRole("button", { name: "Cancel" });
+    await cancel.focus();
+    // Assert focus before the key press so a lost focus is reported as such, not as a missing result.
+    await expect(cancel).toBeFocused();
     await page.keyboard.press("Enter");
     await expect(overlay.getByText("Last dialog result: dismissed")).toBeAttached();
     await expect(trigger).toBeFocused();
 
     await trigger.focus();
     await page.keyboard.press("Space");
-    await overlay.getByRole("button", { name: "Confirm action" }).focus();
+    const confirm = overlay.getByRole("button", { name: "Confirm action" });
+    await confirm.focus();
+    await expect(confirm).toBeFocused();
     await page.keyboard.press("Space");
     await expect(overlay.getByText("Last dialog result: confirmed")).toBeAttached();
 
