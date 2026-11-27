@@ -590,6 +590,9 @@ test.describe("egui-web-accesskit E2E", () => {
     await trigger.focus();
     await page.keyboard.press("Enter");
     const cancel = overlay.getByRole("button", { name: "Cancel" });
+    // egui mirrors the dialog controls as disabled for a short time after the modal opens; a disabled
+    // button ignores focus, so wait until it is enabled before focusing it.
+    await expect(cancel).toBeEnabled();
     await cancel.focus();
     // Assert focus before the key press so a lost focus is reported as such, not as a missing result.
     await expect(cancel).toBeFocused();
@@ -600,6 +603,7 @@ test.describe("egui-web-accesskit E2E", () => {
     await trigger.focus();
     await page.keyboard.press("Space");
     const confirm = overlay.getByRole("button", { name: "Confirm action" });
+    await expect(confirm).toBeEnabled();
     await confirm.focus();
     await expect(confirm).toBeFocused();
     await page.keyboard.press("Space");
