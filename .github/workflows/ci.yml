@@ -175,6 +175,37 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  webkit:
+    name: Browser end-to-end (WebKit, Safari engine, not yet required)
+    needs: e2e
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+      - uses: actions/download-artifact@v7
+        with:
+          name: demo-dist
+          path: examples/demo/dist
+      - working-directory: e2e
+        run: |
+          npm ci
+          npx playwright install --with-deps webkit
+      - name: WebKit suite
+        working-directory: e2e
+        run: npx playwright test --project=webkit
+      - name: Upload WebKit Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: webkit-playwright-report
+          path: e2e/playwright-report
+          retention-days: 14
+
   deploy:
     name: Publish demo to GitHub Pages (per branch)
     needs: [check, licenses, e2e]

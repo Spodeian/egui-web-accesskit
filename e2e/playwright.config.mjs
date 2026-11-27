@@ -35,6 +35,13 @@ export default defineConfig({
       },
     },
     {
+      // WebKit is Safari's engine. VoiceOver users on macOS and iOS run it.
+      name: "webkit",
+      use: {
+        browserName: "webkit",
+      },
+    },
+    {
       name: "firefox",
       use: {
         browserName: "firefox",
