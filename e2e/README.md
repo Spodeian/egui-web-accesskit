@@ -62,3 +62,31 @@ npx playwright test --project=chrome --headed
 - Every test fails on any `pageerror` or `console.error`, so wasm panics and logged errors can't pass silently.
 
 The suite is browser-only, matching the crate: it runs against the wasm build of the demo, and the native build of the crate is covered by `cargo test` (mapper unit tests and the no-op plugin test).
+
+## Manual screen reader checks
+
+Automated tests verify the DOM and the accessibility tree, not what a screen reader speaks. Run this script before each release with a real screen reader, and record the result in the table. Use the demo at `/` (mirror on), or the published site.
+
+Setup: NVDA with Chrome (Windows), or VoiceOver with Safari (macOS). Turn on speech viewer or speech history so every announcement is recorded.
+
+| #   | Steps                                                                              | Expected (what to listen for)                                                                                              | Pass? |
+| --- | ---------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- | ----- |
+| 1   | Tab to `Password:`                                                                 | The field is announced as a password field. No characters are read. Typed characters are echoed as masked characters only. |       |
+| 2   | Type two characters, then press Backspace three times                              | Each deleted character is announced once. The third Backspace is silent. No repeated "blank".                              |       |
+| 3   | Tab to `Open dialog`, press Enter                                                  | Focus moves into `Confirmation dialog` (an alert dialog). Focus lands on `Close dialog`.                                   |       |
+| 4   | In the dialog, press Tab repeatedly                                                | Focus cycles `Close dialog`, `Cancel`, `Confirm action`, then back. Focus never reaches the page behind the dialog.        |       |
+| 5   | Press Escape                                                                       | The dialog closes and focus returns to `Open dialog`.                                                                      |       |
+| 6   | Tab to `Search:`, then to `Note:`                                                  | `Search:` announces an autocomplete mode (set explicitly by the demo). `Note:` does not.                                   |       |
+| 7   | Press the `Change section heading level` button, then navigate by headings (H key) | The section heading is announced at level 3 after the change. Focus stays on the button.                                   |       |
+| 8   | Press `Turn screen reader mirror off`                                              | The page reloads without the mirror. Turn the mirror back on from a page opened without `?bridge=off`.                     |       |
+
+Known limits found by this script's authors:
+
+- The lazy activation control (`?lazy=1`) is 1px and `pointer-events: none`. It is meant for assistive technology and cannot be reached with a mouse.
+- Headings are not focusable in egui, so the focus loss a recreated element could cause is not reachable from the demo. Focus stays on the control that changes a heading's level (covered by an e2e test).
+
+## Investigations and open reports
+
+- **"edit has autocomplete" announcement.** Not reproduced. The bridge only emits `aria-autocomplete` when an application sets an AccessKit autocomplete mode, and the demo sets it on `Search:` alone. A Chromium accessibility-tree check of plain text inputs (with and without `autocomplete="off"`, `aria-autocomplete="none"`, `role="textbox"`, `type="search"`) found no autocomplete property. The report still needs the exact field, markup or application code, and the screen reader version.
+- **Password value exposure.** Fixed: the DOM mask is one ASCII `*` per character. Chromium exposes one glyph per UTF-8 byte, so the old U+2022 mask was read as three glyphs per character.
+- **ComboBox keyboard activation on 0.35 and 0.36.** Not root-caused. The step is removed on those branches (see the root README).

@@ -1,0 +1,4 @@
+# Runs wasm32 test binaries under wasm-bindgen-test (node by default). Requires the
+# wasm-bindgen-cli version that matches Cargo.lock (0.2.130) on PATH.
+[target.wasm32-unknown-unknown]
+runner = "wasm-bindgen-test-runner"
