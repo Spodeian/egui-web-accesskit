@@ -9,6 +9,16 @@ The crate versions mirror `egui`'s minor version:
 
 ## Unreleased
 
+### Added
+- Demo: a reload-based screen reader mirror toggle (`?bridge=off`, and a button that reloads the page with the opposite setting). egui keeps one plugin per type, so a torn-down bridge cannot be re-added in place.
+- Demo: a section heading whose level toggles between 2 and 3, with an end-to-end test that focus stays on the control that changes it.
+- Unit tests for the wasm32-only helpers in `src/dom.rs` (`wasm-bindgen-test`), run by CI.
+- Demo build script (`examples/demo/build-dist.sh`) with a release profile, the wasm32 baseline target features, explicit `wasm-opt -Oz` and HTML minification.
+- CI: per-branch GitHub Pages publishing, a post-deploy smoke test, formatting, licence (`cargo-deny`) and Prettier gates. Firefox runs headed under Xvfb as a non-required job.
+
+### Changed
+- Demo wasm: 5.69 MB to 4.23 MB raw, and 1.76 MB to 1.56 MB gzipped. The JS glue is not minified, because trunk's subresource-integrity hash would break.
+
 ### Fixed
 - Keyboard activation of a dialog trigger (Enter or Space) no longer drops DOM focus to `document.body`. The modal's `inert` background is applied to the focused trigger, so the bridge now moves focus into the dialog, traps `Tab` / `Shift+Tab` inside it, and restores focus to the trigger on close.
 - Typing and Backspace in text fields no longer rewrite `aria-label` on every keystroke, which screen readers announced again (for example as "blank" once the field was empty).
