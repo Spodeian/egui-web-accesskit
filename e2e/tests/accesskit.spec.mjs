@@ -180,6 +180,13 @@ test.describe("egui-web-accesskit E2E", () => {
       el.focus();
       el.setSelectionRange(0, el.value.length);
     });
+    // Typing must replace the whole value. Wait until the selection is really full, and still
+    // full after two frames, so a late selection update from the bridge cannot be typed over.
+    const fullSelection = () =>
+      noteBox.evaluate((el) => el.selectionStart === 0 && el.selectionEnd === el.value.length);
+    await expect.poll(fullSelection).toBe(true);
+    await settleFrames(page);
+    expect(await fullSelection()).toBe(true);
     await page.keyboard.type("!hello");
     await expect(overlay.getByText("Warning banner")).toBeAttached();
     await expect(noteBox).toHaveValue("!hello");
@@ -597,14 +604,23 @@ test.describe("egui-web-accesskit E2E", () => {
     const trigger = overlay.getByRole("button", { name: "Open dialog" });
     await trigger.focus();
     await page.keyboard.press("Enter");
-    await overlay.getByRole("button", { name: "Cancel" }).focus();
+    const cancel = overlay.getByRole("button", { name: "Cancel" });
+    // egui mirrors the dialog controls as disabled for a short time after the modal opens; a disabled
+    // button ignores focus, so wait until it is enabled before focusing it.
+    await expect(cancel).toBeEnabled();
+    await cancel.focus();
+    // Assert focus before the key press so a lost focus is reported as such, not as a missing result.
+    await expect(cancel).toBeFocused();
     await page.keyboard.press("Enter");
     await expect(overlay.getByText("Last dialog result: dismissed")).toBeAttached();
     await expect(trigger).toBeFocused();
 
     await trigger.focus();
     await page.keyboard.press("Space");
-    await overlay.getByRole("button", { name: "Confirm action" }).focus();
+    const confirm = overlay.getByRole("button", { name: "Confirm action" });
+    await expect(confirm).toBeEnabled();
+    await confirm.focus();
+    await expect(confirm).toBeFocused();
     await page.keyboard.press("Space");
     await expect(overlay.getByText("Last dialog result: confirmed")).toBeAttached();
 
@@ -744,6 +760,54 @@ test.describe("egui-web-accesskit E2E", () => {
     await expect(heading3).toHaveJSProperty("tagName", "H3");
     // Recreating the heading must not move focus: the control that changed it keeps it.
     await expect(changeBtn).toBeFocused();
+    expect(errors).toEqual([]);
+  });
+
+  test("axe-core finds no violations after the demo's stateful controls change", async ({
+    page,
+  }) => {
+    const errors = [];
+    page.on("pageerror", (err) => errors.push(err.message));
+    page.on("console", (msg) => {
+      if (msg.type() === "error") errors.push(msg.text());
+    });
+
+    await page.goto("/");
+    const overlay = page.locator('[data-egui-accesskit="true"]');
+    await expect(overlay).toBeAttached({ timeout: 15000 });
+
+    const scan = async () =>
+      new AxeBuilder({ page })
+        .include('[data-egui-accesskit="true"]')
+        .disableRules(["color-contrast"])
+        .analyze();
+
+    // Section heading changed to level 3.
+    await overlay.getByRole("button", { name: "Change section heading level" }).focus();
+    await page.keyboard.press("Enter");
+    await expect(
+      overlay.getByRole("heading", { name: "Section heading (level 3)", level: 3 })
+    ).toBeAttached();
+    expect((await scan()).violations).toEqual([]);
+
+    // Search (explicit autocomplete) with text typed in.
+    const searchBox = overlay.getByRole("textbox", { name: "Search:" });
+    await searchBox.focus();
+    await page.keyboard.type("egui");
+    await expect(searchBox).toHaveValue("egui");
+    expect((await scan()).violations).toEqual([]);
+
+    // Password field with a value.
+    await overlay.getByLabel("Password:").focus();
+    expect((await scan()).violations).toEqual([]);
+
+    // Dialog answered with Confirm.
+    await clickWithMouse(page, overlay.getByRole("button", { name: "Open dialog" }));
+    await overlay.getByRole("button", { name: "Confirm action" }).focus();
+    await page.keyboard.press("Enter");
+    await expect(overlay.getByText("Last dialog result: confirmed")).toBeAttached();
+    expect((await scan()).violations).toEqual([]);
+
     expect(errors).toEqual([]);
   });
 
