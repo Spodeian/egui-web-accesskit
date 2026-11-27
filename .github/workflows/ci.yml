@@ -141,7 +141,7 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: e2e/package-lock.json
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: demo-dist
           path: examples/demo/dist
@@ -187,7 +187,7 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: e2e/package-lock.json
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: demo-dist
           path: examples/demo/dist
