@@ -173,6 +173,13 @@ test.describe("egui-web-accesskit E2E", () => {
       el.focus();
       el.setSelectionRange(0, el.value.length);
     });
+    // Typing must replace the whole value. Wait until the selection is really full, and still
+    // full after two frames, so a late selection update from the bridge cannot be typed over.
+    const fullSelection = () =>
+      noteBox.evaluate((el) => el.selectionStart === 0 && el.selectionEnd === el.value.length);
+    await expect.poll(fullSelection).toBe(true);
+    await settleFrames(page);
+    expect(await fullSelection()).toBe(true);
     await page.keyboard.type("!hello");
     await expect(overlay.getByText("Warning banner")).toBeAttached();
     await expect(noteBox).toHaveValue("!hello");
