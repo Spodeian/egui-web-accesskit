@@ -747,6 +747,54 @@ test.describe("egui-web-accesskit E2E", () => {
     expect(errors).toEqual([]);
   });
 
+  test("axe-core finds no violations after the demo's stateful controls change", async ({
+    page,
+  }) => {
+    const errors = [];
+    page.on("pageerror", (err) => errors.push(err.message));
+    page.on("console", (msg) => {
+      if (msg.type() === "error") errors.push(msg.text());
+    });
+
+    await page.goto("/");
+    const overlay = page.locator('[data-egui-accesskit="true"]');
+    await expect(overlay).toBeAttached({ timeout: 15000 });
+
+    const scan = async () =>
+      new AxeBuilder({ page })
+        .include('[data-egui-accesskit="true"]')
+        .disableRules(["color-contrast"])
+        .analyze();
+
+    // Section heading changed to level 3.
+    await overlay.getByRole("button", { name: "Change section heading level" }).focus();
+    await page.keyboard.press("Enter");
+    await expect(
+      overlay.getByRole("heading", { name: "Section heading (level 3)", level: 3 })
+    ).toBeAttached();
+    expect((await scan()).violations).toEqual([]);
+
+    // Search (explicit autocomplete) with text typed in.
+    const searchBox = overlay.getByRole("textbox", { name: "Search:" });
+    await searchBox.focus();
+    await page.keyboard.type("egui");
+    await expect(searchBox).toHaveValue("egui");
+    expect((await scan()).violations).toEqual([]);
+
+    // Password field with a value.
+    await overlay.getByLabel("Password:").focus();
+    expect((await scan()).violations).toEqual([]);
+
+    // Dialog answered with Confirm.
+    await clickWithMouse(page, overlay.getByRole("button", { name: "Open dialog" }));
+    await overlay.getByRole("button", { name: "Confirm action" }).focus();
+    await page.keyboard.press("Enter");
+    await expect(overlay.getByText("Last dialog result: confirmed")).toBeAttached();
+    expect((await scan()).violations).toEqual([]);
+
+    expect(errors).toEqual([]);
+  });
+
   test("supports Shadow DOM via WebAccessKitPlugin::from_canvas", async ({ page }) => {
     const errors = [];
     page.on("pageerror", (err) => errors.push(err.message));
